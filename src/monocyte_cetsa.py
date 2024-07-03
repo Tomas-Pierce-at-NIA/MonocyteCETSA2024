@@ -13,9 +13,9 @@ from pathlib import Path
 import seaborn
 from matplotlib import pyplot
 import numpy
-from sklearn import preprocessing, linear_model
+from sklearn import preprocessing, linear_model, svm
 
-
+import itertools
 
 
 def load_candidates():
@@ -241,7 +241,7 @@ idents = []
 models = []
 scores = []
 
-cuboid_featureprep = preprocessing.PolynomialFeatures(2)
+cuboid_featureprep = preprocessing.PolynomialFeatures(3)
 
 for identifier, grouptable in protein_groups:
     numeric_only = grouptable.drop(['PG.ProteinAccessions', 
@@ -261,6 +261,7 @@ for identifier, grouptable in protein_groups:
     x_data = cuboid_featureprep.fit_transform(x_base)
     
     ridge = linear_model.RidgeCV(alphas=(0.01,0.1, 0.5, 1.0, 2.0, 5.0))
+    
     try:
         ridge.fit(x_data, y)
     except ValueError as er:
@@ -293,7 +294,7 @@ for identifier, grouptable in protein_groups:
     scores.append(score)
     
     pyplot.show()
-
+      
 pyplot.hist(scores)
 pyplot.xlabel("R-squared score")
 pyplot.ylabel("Number of proteins")
@@ -305,3 +306,73 @@ print(cuboid_featureprep.get_feature_names_out(['Temperature',
                                                )
       )
 
+
+groupcycle = [(1,0,0,0),(0,1,0,0),(0,0,1,0),(0,0,0,1)]
+
+interp_conditions = [groupcycle[i % 4] for i in range((71-37)*4)]
+interp_conditions = numpy.array(interp_conditions)
+
+for identifier, grouptable in protein_groups:
+    numeric_only = grouptable.drop(['PG.ProteinAccessions', 
+                                    'PG.Genes', 
+                                    'R.Replicate', 
+                                    'Treatment'],
+                                   axis=1,
+                                   inplace=False)
+    
+    y = numpy.array(numeric_only['Normalized_FG_Quantity'])
+    
+    #y = numpy.array(numeric_only['log2(Normalized FG Quantity)'])
+    
+    x_base = numpy.array(numeric_only[['Temperature',
+                                       'log2(Temperature)',
+                                       *categories]])
+    x_data = cuboid_featureprep.fit_transform(x_base)
+    
+    interpolater = svm.SVR(C=0.9)
+    try:
+        interpolater.fit(x_data, y)
+    except ValueError as er:
+        print("Could not fit {}".format(identifier))
+        print("reason: {}".format(er))
+        print("skipping")
+        continue
+    
+    temps = list(range(37,71))
+    logtemps = numpy.log2(temps)
+    
+    interp_temp = numpy.array([temps, logtemps]).T
+    interp_temp = numpy.repeat(interp_temp, 4, axis=0)
+    
+    base_interpol_feats = numpy.concatenate((interp_temp, 
+                                             interp_conditions), axis=1)
+    
+    interpol_feats = cuboid_featureprep.transform(base_interpol_feats)
+    
+    predictions = interpolater.predict(interpol_feats)
+    
+    dframe = pandas.DataFrame(base_interpol_feats,
+                              columns=['Temperature',
+                                       'log2(Temp)',
+                                       *categories])
+    
+    dframe = dframe.assign(Prediction = predictions)
+    dframe = dframe.assign(Treatment = treatmentEncoder.inverse_transform(
+        base_interpol_feats[:,2:])[:,0])
+    
+    ax = seaborn.lineplot(dframe, 
+                          x='Temperature', 
+                          y='Prediction',
+                          hue='Treatment'
+                     )
+    
+    seaborn.scatterplot(grouptable, x='Temperature',
+                        y='Normalized_FG_Quantity',
+                        hue='Treatment',
+                        style='R.Replicate',
+                        ax=ax)
+    
+    pyplot.show()
+    
+    
+    
