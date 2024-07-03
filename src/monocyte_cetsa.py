@@ -12,6 +12,11 @@ import pandas
 from pathlib import Path
 import seaborn
 from matplotlib import pyplot
+import numpy
+from sklearn import preprocessing, linear_model
+
+
+
 
 def load_candidates():
     CACHED = r"C:\Users\piercetf\Downloads\CachedCETSAData\Candidates.tsv"
@@ -174,6 +179,9 @@ def display_counts(data):
 
 
 def norm_protein_mintemp(data):
+    """"Normalize the protein quantity against the protein quantity observed
+    at the lowest tested temperature
+    """
     mintemp = min(data['Temperature'])
     lowtempdata = data.loc[data['Temperature'] == mintemp,:].copy()
     lowtempdata.loc[:,'Referent_Protein'] = lowtempdata.loc[:, 'Total_FG_Quantity']
@@ -191,13 +199,109 @@ def norm_protein_mintemp(data):
     return data['Total_FG_Quantity'] / merged_frame['Referent_Protein']
 
 
-filtered_data, filtered_candidates = load_data()
-calc_total_protein_quantity(filtered_data)
+def prepare_data():
+    "General data loading routine, including filtering and normalization"
+    filtered_data, filtered_candidates = load_data()
+    calc_total_protein_quantity(filtered_data)
+    display_counts(filtered_data)
+    filtered_data.loc[:,"Normalized_FG_Quantity"] = norm_protein_mintemp(filtered_data)
+    return filtered_data, filtered_candidates
+    
 
-display_counts(filtered_data)
+data, candidates = prepare_data()
 
-filtered_data.loc[:,"Normalized_FG_Quantity"] = norm_protein_mintemp(filtered_data)
+focused_subset = data.loc[:, ['PG.ProteinAccessions',
+                              'PG.Genes',
+                              'R.Replicate',
+                              'Temperature',
+                              'Treatment',
+                              'Normalized_FG_Quantity']]
 
-seaborn.scatterplot(filtered_data, x="Temperature", y="Normalized_FG_Quantity")
-pyplot.show()
+focused_subset.loc[:, "log2(Normalized FG Quantity)"] = numpy.log2(
+    focused_subset.loc[:,"Normalized_FG_Quantity"]
+    )
+
+focused_subset.loc[:, "log2(Temperature)"] = numpy.log2(
+    focused_subset.loc[:, "Temperature"]
+    )
+
+treatmentEncoder = preprocessing.OneHotEncoder(sparse_output=False, 
+                                               dtype=numpy.int32)
+treatmentEncoder.fit(data.loc[:,['Treatment']])
+treatmentOneHot = treatmentEncoder.transform(data.loc[:, ['Treatment']])
+
+categories = treatmentEncoder.categories_[0]
+
+for i, category in enumerate(categories):
+    focused_subset = focused_subset.assign(**{category : treatmentOneHot[:,i]})
+
+protein_groups = focused_subset.groupby(by=['PG.ProteinAccessions', 'PG.Genes'])
+
+idents = []
+models = []
+scores = []
+
+cuboid_featureprep = preprocessing.PolynomialFeatures(2)
+
+for identifier, grouptable in protein_groups:
+    numeric_only = grouptable.drop(['PG.ProteinAccessions', 
+                                    'PG.Genes', 
+                                    'R.Replicate', 
+                                    'Treatment'],
+                                   axis=1,
+                                   inplace=False)
+    
+    y = numpy.array(numeric_only['Normalized_FG_Quantity'])
+    
+    #y = numpy.array(numeric_only['log2(Normalized FG Quantity)'])
+    
+    x_base = numpy.array(numeric_only[['Temperature',
+                                       'log2(Temperature)',
+                                       *categories]])
+    x_data = cuboid_featureprep.fit_transform(x_base)
+    
+    ridge = linear_model.RidgeCV(alphas=(0.01,0.1, 0.5, 1.0, 2.0, 5.0))
+    try:
+        ridge.fit(x_data, y)
+    except ValueError as er:
+        print("Skipping item {} because".format(identifier))
+        print("error raised: {}".format(er))
+        continue
+    
+    preds = ridge.predict(x_data)
+    
+    grouptable.loc[:,"Predictions"] = preds
+    
+    ax = seaborn.lineplot(grouptable, x="Temperature", y="Predictions",hue="Treatment")
+    #ax=None
+    
+    ax = seaborn.scatterplot(grouptable,
+                        x="Temperature",
+                        y='Normalized_FG_Quantity',
+                        hue="Treatment",
+                        style="R.Replicate",
+                        ax=ax)
+    
+    pyplot.title(identifier[0])
+    
+    
+    
+    score = ridge.score(x_data, y)
+    
+    idents.append(identifier)
+    models.append(ridge)
+    scores.append(score)
+    
+    pyplot.show()
+
+pyplot.hist(scores)
+pyplot.xlabel("R-squared score")
+pyplot.ylabel("Number of proteins")
+pyplot.title("Per-protein models' performances")
+
+print(cuboid_featureprep.get_feature_names_out(['Temperature',
+                                                'log2(Temperature)',
+                                                *categories]
+                                               )
+      )
 
