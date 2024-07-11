@@ -14,8 +14,38 @@ from pathlib import Path
 import seaborn
 from matplotlib import pyplot
 import numpy
-from sklearn import preprocessing, linear_model, svm, gaussian_process
-from scipy import optimize, integrate
+from sklearn import preprocessing, linear_model
+from scipy import integrate
+
+import statsmodels.api as sm
+
+# taken from
+# https://stackoverflow.com/questions/44234682/how-to-use-sklearn-when-target-variable-is-a-proportion
+
+# switch to Ridge regression penalty to avoid the model parameters fit
+# from blowing up to enourmous sizes with no meaning
+class LogitRegression(linear_model.Ridge):
+    
+    def fit(self, x, p):
+        p = numpy.asarray(p)
+        y = numpy.log(1 / (1 - p))
+        return super().fit(x, y)
+    
+    def predict(self, x):
+        y = super().predict(x)
+        return 1 / (numpy.exp(-y) + 1)
+
+EPSILON = 1e-10
+R_THRESHOLD = 0.6
+
+def crimp(datum):
+    datum = float(datum)
+    if datum >= 1:
+        return 1.0 - EPSILON
+    elif datum <= 0:
+        return EPSILON
+    else:
+        return datum
 
 def load_candidates():
     CACHED = r"C:\Users\piercetf\Downloads\CachedCETSAData\Candidates.tsv"
@@ -459,8 +489,106 @@ if __name__ == '__main__':
         
     #breakpoint()
     #focused_subset = focused_subset.drop_duplicates()
-    
+    focused_subset.loc[:,"Crimped_Protein"] = focused_subset.loc[:,"Normalized_FG_Quantity"].map(crimp)
+                                                                 
     protein_groups = focused_subset.groupby(by=['PG.ProteinAccessions', 'PG.Genes'])
+    
+    grouplings = numpy.concatenate([numpy.identity(4)] * (71-37), axis=0)
+    templings = numpy.repeat(numpy.arange(37, 71), 4)[...,numpy.newaxis]
+    spaninputs = numpy.concatenate((templings, grouplings), axis=1)
+    
+    models = []
+    idents = []
+    scores = []
+    
+    statmodels = []
+    
+    cats = treatmentEncoder.categories_[0]
+    
+    i = 0
+    
+    interactionEncoder = preprocessing.PolynomialFeatures(interaction_only=True,
+                                                          include_bias=False)
+    
+    for ident, table in protein_groups:
+        cleantable = table.dropna()
+        if len(cleantable) == 0:
+            continue
+        
+        inputdata = interactionEncoder.fit_transform(
+            cleantable.loc[:, ['Temperature', *cats]]
+            )
+        
+        
+        logitmodel = LogitRegression()
+        logitmodel.fit(inputdata,
+                       cleantable.loc[:, ['Crimped_Protein']].values
+                       )
+        
+        olsmodel = sm.OLS(endog=cleantable.loc[:, ['Crimped_Protein']].values,
+                          exog=inputdata)
+        est = olsmodel.fit()
+        
+        statmodels.append(est)
+        
+        spaninteract = interactionEncoder.fit_transform(spaninputs)
+        predictions = logitmodel.predict(spaninteract)
+        modelarray = numpy.concatenate((spaninputs, predictions), axis=1)
+        modeltable = pandas.DataFrame(modelarray,
+                                      columns=['Temperature', 
+                                              *cats,
+                                              'Predicted_Crimped_Protein']
+                                      )
+        
+        modeltable.loc[:, "Treatment"] = treatmentEncoder.inverse_transform(
+            grouplings
+            ).flatten()
+        
+        # ax = seaborn.scatterplot(table, 
+        #                          x='Temperature', 
+        #                          y='Normalized_FG_Quantity',
+        #                          hue='Treatment',
+        #                          markers=['o'])
+        # seaborn.scatterplot(table,
+        #                     x='Temperature',
+        #                     y='Crimped_Protein',
+        #                     hue='Treatment',
+        #                     markers=['+'],
+        #                     ax=ax)
+        # seaborn.lineplot(modeltable,
+        #                     x='Temperature',
+        #                     y='Predicted_Crimped_Protein',
+        #                     hue='Treatment',
+        #                     markers=['s'],
+        #                     ax=ax)
+        # pyplot.show()
+        idents.append(ident)
+        models.append(logitmodel)
+        
+        interactionfeatures = interactionEncoder.fit_transform(
+            cleantable.loc[:, ['Temperature', *cats]]
+            )
+        
+        score = logitmodel.score(interactionfeatures,
+                                 cleantable.loc[:, ['Normalized_FG_Quantity']].values)
+        
+        
+        scores.append(score)
+        print(score)
+    
+    
+    
+    scores = numpy.array(scores)
+    model_array = numpy.array(models)
+    identifiers = numpy.array(idents)
+    
+    statmodels = numpy.array(statmodels)
+    
+    passing_scores = scores[scores > R_THRESHOLD]
+    good_enough_models = model_array[scores > R_THRESHOLD]
+    protein_modeled = identifiers[scores > R_THRESHOLD]
+    passed_statmodels = statmodels[scores > R_THRESHOLD]
+    
     
     # prot_idents, prot_preds, models = fit_each_protein(linear_model.RidgeCV(), 
     #                                                    protein_groups, 
@@ -482,19 +610,13 @@ if __name__ == '__main__':
     differences = calc_differences(focused_subset)
     
     diffs1 = get_average_differences(differences, 'Fisetin v DMSO')
-    
     diffs2 = get_average_differences(differences, 'Quercetin v DMSO')
-    
     diffs3 = get_average_differences(differences, 'Myricetin v DMSO')
-    
     diffs4 = get_average_differences(differences, 'Fisetin v Myricetin')
-    
     diffs5 = get_average_differences(differences, 'Quercetin v Myricetin')
     
     fisetin_candidates = diffs1[diffs1['Fisetin v DMSO'] > (diffs1['Fisetin v DMSO'].mean() + 2 * diffs1['Fisetin v DMSO'].std())]
-    
     quercetin_candidates = diffs2[diffs2['Quercetin v DMSO'] > (diffs2['Quercetin v DMSO'].mean() + 2 * diffs2['Quercetin v DMSO'].std())]
-    
     myricetin_candidates = diffs3[diffs3['Myricetin v DMSO'] > (diffs3['Myricetin v DMSO'].mean() + 2 * diffs3['Myricetin v DMSO'].std())]
     
     fisetin_targets = set(fisetin_candidates['PG.ProteinAccessions'])
@@ -509,9 +631,7 @@ if __name__ == '__main__':
     
     
     shared_nonsenolytic = fisetin_targets.intersection(quercetin_targets).intersection(myricetin_targets)
-    
     shared_targets = fisetin_targets.intersection(quercetin_targets).difference(myricetin_targets)
-    
     unique_fisetin_targets = fisetin_targets.difference(quercetin_targets).difference(myricetin_targets)
     unique_quercetin_targets = quercetin_targets.difference(myricetin_targets).difference(fisetin_targets)
     unique_myricetin_targets = myricetin_targets.difference(quercetin_targets).difference(fisetin_targets)
