@@ -7,6 +7,8 @@ Created on Fri Jun 28 11:15:23 2024
 
 # Based on the R script that was provided as a starting file for this project
 
+# and also based very heavily on Childs' NPARC
+
 import copy
 
 import pandas
@@ -15,28 +17,26 @@ import seaborn
 from matplotlib import pyplot
 import numpy
 from sklearn import preprocessing, linear_model
-from scipy import integrate
+from scipy import integrate, stats
 
 import statsmodels.api as sm
 
-# taken from
-# https://stackoverflow.com/questions/44234682/how-to-use-sklearn-when-target-variable-is-a-proportion
+import load_monocyte_cetsa_data as load
 
-# switch to Ridge regression penalty to avoid the model parameters fit
-# from blowing up to enourmous sizes with no meaning
-class LogitRegression(linear_model.Ridge):
-    
-    def fit(self, x, p):
-        p = numpy.asarray(p)
-        y = numpy.log(1 / (1 - p))
-        return super().fit(x, y)
-    
-    def predict(self, x):
-        y = super().predict(x)
-        return 1 / (numpy.exp(-y) + 1)
 
+ALPHA = 0.05
 EPSILON = 1e-10
 R_THRESHOLD = 0.6
+F2_THRESHOLD = 0.35 # Cohen f**2 large effect size criterion
+
+VIEW = False
+
+def logit(arr):
+    return numpy.log(arr / (1 - arr))
+
+def unlogit(arr):
+    return 1 / (numpy.exp(-arr) + 1)
+
 
 def crimp(datum):
     datum = float(datum)
@@ -47,194 +47,6 @@ def crimp(datum):
     else:
         return datum
 
-def load_candidates():
-    CACHED = r"C:\Users\piercetf\Downloads\CachedCETSAData\Candidates.tsv"
-    CANONICAL = r"T:\TGB\LSS\TGU\Users\Tomas\2024_CETSA_MS\Monocyte_CETSA_Statistical_Analysis\CETSA_ind_temp_analysis_starting_files\Candidates.tsv"
-    cached_path = Path(CACHED)
-    canon_path = Path(CANONICAL)
-    try:
-        candidates = pandas.read_csv(cached_path, sep='\t')
-    except Exception as e:
-        print("Trying to load cached version failed, falling back to canonical path")
-        print("Relevant error was: {}".format(e))
-        candidates = pandas.read_csv(canon_path, sep='\t')
-    
-    return candidates
-
-
-def load_basedata():
-    CACHED = r"C:\Users\piercetf\Downloads\CachedCETSAData\Complete CETSA analysis w F-37-4_Report_Delaney_Default (Normal).tsv"
-    CANONICAL = r"T:\TGB\LSS\TGU\Users\Tomas\2024_CETSA_MS\Monocyte_CETSA_Statistical_Analysis\CETSA_ind_temp_analysis_starting_files\Complete CETSA analysis w F-37-4_Report_Delaney_Default (Normal).tsv"
-    cached_path = Path(CACHED)
-    canon_path = Path(CANONICAL)
-    try:
-        basedata = pandas.read_csv(cached_path, sep='\t')
-    except Exception as e:
-        print("Trying to load cached version failed, falling back to canonical path")
-        print("Relevant error was: {}".format(e))
-        basedata = pandas.read_csv(canon_path, sep='\t')
-    
-    # empty string is more accurate and avoids NaN-based pathology
-    # later on
-    basedata['PG.Genes'] = basedata['PG.Genes'].fillna('')
-    return basedata
-
-def remove_unipeptides(data_table, candidate_table) -> (pandas.DataFrame, pandas.DataFrame):
-    """ Remove proteins identified by only 1 unique peptide from both the
-    data table and the candidates table.
-    Returns the results in the same order as the parameters.
-    """
-    onepeptide_candidates = candidate_table[candidate_table['# Unique Total Peptides'] == 1]
-    unipeptide_ids = onepeptide_candidates['UniProtIds'].unique()
-    multipeptide_candidates = candidate_table[candidate_table['# Unique Total Peptides'] > 1]
-    
-    def not_in_unipeptides(accession):
-        return accession not in unipeptide_ids
-    
-    multipeptide_data_membership = data_table['PG.ProteinAccessions'].map(
-        not_in_unipeptides
-        )
-    
-    multipeptide_data_table = data_table.loc[multipeptide_data_membership,:]
-    
-    return multipeptide_data_table, multipeptide_candidates
-
-def remove_deprecated_columns(table):
-    colnames = list(table.columns)
-    for cname in colnames:
-        if cname.startswith('[DEPRECATED]'):
-            del table[cname]
-
-def get_left(s :str) -> (str, str): # helper function
-    return s.split(' ')[0]
-
-def get_right(s :str) -> (str, str): # helper function
-    return s.split(' ')[1]
-
-
-def rename_special_columns(candidate_table):
-    """take a prior table as input and produce a new table,
-    where variables with special characters have been renamed to
-    prevent the potential for problems.
-    """
-    return candidate_table.rename(columns={
-        "# of Ratios" : "Number_of_Ratios",
-        "% Change" : "Percent_Change",
-        "# Unique Total Peptides" : "Number_Unique_Total_Peptides",
-        "# Unique Total EG.Id" : "Number_Unique_Total_EGid"
-        })
-
-
-def load_data():
-    """Load in data and perform filtering and data processing steps
-    """
-    basedata = load_basedata()
-    candidates = load_candidates()
-    
-    multipep_data, multipep_candidates = remove_unipeptides(basedata, candidates)
-    
-    remove_deprecated_columns(multipep_candidates)
-    
-    del multipep_candidates['Valid'] # don't know, based on template
-    
-    # add aliases for variables to avoid problems with special characters
-    multipep_candidates = rename_special_columns(multipep_candidates)
-    
-    # split out between substance and temperature
-    multipep_candidates.loc[:, "Treatment_Numerator"] = multipep_candidates["Condition Numerator"].map(get_left)
-    multipep_candidates.loc[:, "Temperature_Numerator"] = multipep_candidates["Condition Numerator"].map(get_right)
-    multipep_candidates.loc[:, "Treatment_Denominator"] = multipep_candidates["Condition Denominator"].map(get_left)
-    multipep_candidates.loc[:, "Temperature_Denominator"] = multipep_candidates["Condition Denominator"].map(get_right)
-    
-    # only consider comparisons at the same temperature
-    sametemp_multipep_candidates = multipep_candidates.loc[multipep_candidates.Temperature_Numerator == multipep_candidates.Temperature_Denominator,:].copy()
-    
-    
-    temp_ints = pandas.to_numeric(sametemp_multipep_candidates["Temperature_Numerator"])
-    sametemp_multipep_candidates['Temperature'] = temp_ints
-    
-    # split out between substance and temperature
-    multipep_data = multipep_data.assign(
-        Treatment=multipep_data["R.Condition"].map(get_left),
-        Temperature=pandas.to_numeric(multipep_data["R.Condition"].map(get_right))
-        )
-    
-    return multipep_data, sametemp_multipep_candidates
-
-def calc_total_protein_quantity(peptide_data):
-    """Total the amount of material observed per-protein identification"""
-    grouped = peptide_data.groupby(by=['PG.ProteinAccessions', 
-                                     'PG.Genes', 
-                                     'R.Replicate',
-                                     'Treatment',
-                                     'Temperature'])
-    # I believe this is the total protein quantity
-    total_fg = grouped.sum()['FG.Quantity'] 
-    
-    # closest known analog to dplyr `ungroup` function
-    # see link
-    # https://stackoverflow.com/questions/67144303/how-do-i-replicate-r-ungroup-in-python
-    peptide_data['Total_FG_Quantity'] = total_fg.reindex(
-        peptide_data[['PG.ProteinAccessions',
-                      'PG.Genes',
-                      'R.Replicate',
-                      'Treatment',
-                      'Temperature']]
-        ).values
-
-def display_counts(data):
-    """display the number of tested temperature and number of detected proteins
-    as a function of the replicate and treatment"""
-    itemcounts = data.groupby(
-        by=["R.Replicate", "Treatment"]
-        ).nunique().loc[:,["PG.ProteinAccessions", "Temperature"]].reset_index()
-    print(itemcounts)
-    seaborn.barplot(data=itemcounts, 
-                    x="Treatment", 
-                    y="Temperature", 
-                    hue="R.Replicate"
-                    )
-    pyplot.ylabel("Number of Temperatures tested")
-    pyplot.show()
-    
-    seaborn.barplot(data=itemcounts,
-                    x="Treatment",
-                    y="PG.ProteinAccessions",
-                    hue="R.Replicate"
-                    )
-    pyplot.ylabel("Number of detected proteins")
-
-    pyplot.show()
-
-
-def norm_protein_mintemp(data):
-    """"Normalize the protein quantity against the protein quantity observed
-    at the lowest tested temperature
-    """
-    mintemp = min(data['Temperature'])
-    lowtempdata = data.loc[data['Temperature'] == mintemp,:].copy()
-    lowtempdata.loc[:,'Referent_Protein'] = lowtempdata.loc[:, 'Total_FG_Quantity']
-    lowtempgroups = lowtempdata.groupby(
-        by=["PG.ProteinAccessions",
-            "PG.Genes",
-            "R.Replicate",
-            "Treatment"]).min()
-    merged_frame = data.join(lowtempgroups, how="left",
-                             on=["PG.ProteinAccessions",
-                                 "PG.Genes",
-                                 "R.Replicate",
-                                 "Treatment"],
-                             rsuffix="_lowtemp")
-    return data['Total_FG_Quantity'] / merged_frame['Referent_Protein']
-
-
-def prepare_data():
-    "General data loading routine, including filtering and normalization"
-    filtered_data, filtered_candidates = load_data()
-    calc_total_protein_quantity(filtered_data)
-    display_counts(filtered_data)
-    filtered_data.loc[:,"Normalized_FG_Quantity"] = norm_protein_mintemp(filtered_data)
-    return filtered_data, filtered_candidates
 
 
 def interpolate(fitted_model, cat_encode, cuboid=True, feat_args=(3,)) -> pandas.DataFrame:
@@ -446,9 +258,50 @@ def get_average_differences(differences, comparison='Fisetin v DMSO'):
                              comparison : averages}
                             )
 
+def euclidean(vec1, vec2):
+    v1 = numpy.array(vec1)
+    v2 = numpy.array(vec2)
+    diffs = v1 - v2
+    squares = diffs ** 2
+    total = squares.sum()
+    return numpy.sqrt(total)
+
+
+def logfold_euclidean(vec1, vec2):
+    # log(A/B) = log(A) - log(B)
+    v1 = numpy.array(vec1)
+    v2 = numpy.array(vec2)
+    log1 = numpy.log2(v1)
+    log2 = numpy.log2(v2)
+    return euclidean(log1, log2)
+    
+
+def group_differences(model):
+    dmsoparams = model.coef_[0, [1, 5]]
+    fisetinparams = model.coef_[0, [2, 6]]
+    myricetinparams = model.coef_[0, [3, 7]]
+    quercetinparams = model.coef_[0, [4, 8]]
+    
+    fisetin_v_dmso = logfold_euclidean(fisetinparams, dmsoparams)
+    quercetin_v_dmso = logfold_euclidean(quercetinparams, dmsoparams)
+    myricetin_v_dmso = logfold_euclidean(myricetinparams, dmsoparams)
+    
+    fisetin_v_myricetin = logfold_euclidean(fisetinparams, myricetinparams)
+    quercetin_v_myricetin = logfold_euclidean(quercetinparams, myricetinparams)
+    
+    return [
+        fisetin_v_dmso,
+        quercetin_v_dmso,
+        myricetin_v_dmso,
+        fisetin_v_myricetin,
+        quercetin_v_myricetin
+        ]
+
+
+
 
 if __name__ == '__main__':
-    data, candidates = prepare_data()
+    data, candidates = load.prepare_data()
     
     focused_subset = data.loc[:, ['PG.ProteinAccessions',
                                   'PG.Genes',
@@ -461,10 +314,6 @@ if __name__ == '__main__':
         focused_subset.loc[:,"Normalized_FG_Quantity"]
         )
     
-    # focused_subset.loc[:, "log2(Temperature)"] = numpy.log2(
-    #     focused_subset.loc[:, "Temperature"]
-    #     )
-    
     focused_subset.loc[:, "arctan(Temp)"] = numpy.arctan(
         focused_subset.loc[:,"Temperature"]
         )
@@ -474,18 +323,11 @@ if __name__ == '__main__':
     treatmentEncoder.fit(data.loc[:,['Treatment']])
     treatmentOneHot = treatmentEncoder.transform(data.loc[:, ['Treatment']])
     categories = treatmentEncoder.categories_[0]
-    
-    replicateEncoder = preprocessing.OneHotEncoder(sparse_output=False,
-                                                   dtype=numpy.int32)
-    replicatetable = replicateEncoder.fit_transform(data.loc[:,['R.Replicate']])
-    replicate_identities = replicateEncoder.categories_[0]
+
     
     for i, category in enumerate(categories):
         focused_subset = focused_subset.assign(**{category : treatmentOneHot[:,i]})
-        
-    for i, repid in enumerate(replicate_identities):
-        focused_subset = focused_subset.assign(**{f"Replicate{repid}" : 
-                                                  replicatetable[:,i]})
+
         
     #breakpoint()
     #focused_subset = focused_subset.drop_duplicates()
@@ -497,171 +339,215 @@ if __name__ == '__main__':
     templings = numpy.repeat(numpy.arange(37, 71), 4)[...,numpy.newaxis]
     spaninputs = numpy.concatenate((templings, grouplings), axis=1)
     
-    models = []
-    idents = []
-    scores = []
+    templings_with_const = sm.add_constant(templings)
     
-    statmodels = []
     
     cats = treatmentEncoder.categories_[0]
     
-    i = 0
+    
     
     interactionEncoder = preprocessing.PolynomialFeatures(interaction_only=True,
                                                           include_bias=False)
     
+    span_interact_inputs = interactionEncoder.fit_transform(spaninputs)[:,:9]
+    
+    span_treatments = treatmentEncoder.inverse_transform(spaninputs[:,1:])[:,0]
+    
+    aware_models = []
+    naive_models = []
+    prot_ids = []
+    
     for ident, table in protein_groups:
         cleantable = table.dropna()
+        #cleantable = cleantable.loc[cleantable['Temperature'] > 37,:]
         if len(cleantable) == 0:
             continue
+        if max(cleantable['Normalized_FG_Quantity']) > 1:
+            continue
+        if max(cleantable['Temperature']) == 37:
+            continue
         
+        
+        # note that this loses index information
         inputdata = interactionEncoder.fit_transform(
             cleantable.loc[:, ['Temperature', *cats]]
             )
+        inputs_table = pandas.DataFrame(data=inputdata,
+                                 columns=interactionEncoder.get_feature_names_out())
         
+        # get rid of columns of all zeros that are zeros definitionally
+        inputs_table = inputs_table.loc[:, inputs_table.columns[0:9]]
         
-        logitmodel = LogitRegression()
-        logitmodel.fit(inputdata,
-                       cleantable.loc[:, ['Crimped_Protein']].values
-                       )
+        # so we have to get rid of index information here or pandas
+        # will think these things are not aligned
+        norm_prot = cleantable.reset_index()['Normalized_FG_Quantity']
         
-        olsmodel = sm.OLS(endog=cleantable.loc[:, ['Crimped_Protein']].values,
-                          exog=inputdata)
-        est = olsmodel.fit()
+        # this will place the normalized protein in the last column
+        protein_table = inputs_table.assign(Norm_Prot = norm_prot)
         
-        statmodels.append(est)
+        # check to see if not detected in a condition
+        # if there is any condition in which the protein
+        # is not detected, the protein is skipped
+        totals = protein_table.sum()
+        if any(totals == 0):
+            continue
         
-        spaninteract = interactionEncoder.fit_transform(spaninputs)
-        predictions = logitmodel.predict(spaninteract)
-        modelarray = numpy.concatenate((spaninputs, predictions), axis=1)
-        modeltable = pandas.DataFrame(modelarray,
-                                      columns=['Temperature', 
-                                              *cats,
-                                              'Predicted_Crimped_Protein']
-                                      )
+        with_constant = sm.add_constant(protein_table)
         
-        modeltable.loc[:, "Treatment"] = treatmentEncoder.inverse_transform(
-            grouplings
-            ).flatten()
+        naive = sm.Logit(endog=protein_table['Norm_Prot'],
+                         exog=with_constant[['Temperature', 'const']],
+                         missing="raise")
         
-        # ax = seaborn.scatterplot(table, 
-        #                          x='Temperature', 
-        #                          y='Normalized_FG_Quantity',
-        #                          hue='Treatment',
-        #                          markers=['o'])
-        # seaborn.scatterplot(table,
-        #                     x='Temperature',
-        #                     y='Crimped_Protein',
-        #                     hue='Treatment',
-        #                     markers=['+'],
-        #                     ax=ax)
-        # seaborn.lineplot(modeltable,
-        #                     x='Temperature',
-        #                     y='Predicted_Crimped_Protein',
-        #                     hue='Treatment',
-        #                     markers=['s'],
-        #                     ax=ax)
-        # pyplot.show()
-        idents.append(ident)
-        models.append(logitmodel)
+        try:
+            naive_est = naive.fit(maxiter=101)
+        except numpy.linalg.LinAlgError as le:
+            print(le)
+            print(ident)
+            continue
         
-        interactionfeatures = interactionEncoder.fit_transform(
-            cleantable.loc[:, ['Temperature', *cats]]
+        # have to exclude last column from predictor to avoid 
+        # y ~ y problem
+        aware = sm.Logit(endog=protein_table['Norm_Prot'],
+                         exog=protein_table.loc[:, protein_table.columns[:-1]],
+                         missing="raise")
+        
+        try:
+            aware_est = aware.fit(maxiter=101)
+        except numpy.linalg.LinAlgError as le:
+            print(le)
+            print(ident)
+            continue
+        
+        aware_models.append(aware_est)
+        
+        naive_models.append(naive_est)
+        
+        prot_ids.append(ident)
+        
+        if VIEW:
+            naive_preds = naive_est.predict(exog=templings)
+            aware_preds = aware_est.predict(exog=span_interact_inputs)
+            
+            pred_table = pandas.DataFrame(
+                data=span_interact_inputs,
+                columns=interactionEncoder.get_feature_names_out()[:8])
+            
+            pred_table.loc[:,'Treatment'] = span_treatments
+            
+            pred_table.loc[:, 'Naive'] = naive_preds
+            pred_table.loc[:, 'Aware'] = aware_preds
+            
+            protein_table.loc[:, "Treatment"] = treatmentEncoder.inverse_transform(
+                protein_table.loc[:, cats]
+                )[:,0]
+            
+            ax = seaborn.scatterplot(protein_table,
+                                      x='Temperature',
+                                      y='Norm_Prot',
+                                      hue='Treatment')
+            seaborn.lineplot(pred_table,
+                              x='Temperature',
+                              y='Naive',
+                              color='grey',
+                              ax=ax)
+            seaborn.lineplot(pred_table,
+                              x='Temperature',
+                              y='Aware',
+                              hue='Treatment',
+                              ax=ax)
+            pyplot.show()
+        
+    
+    null_rss = []
+    alt_rss = []
+    for aware, naive in zip(aware_models, naive_models):
+        if not aware.mle_retvals['converged']:
+            continue
+        if not naive.mle_retvals['converged']:
+            continue
+        null_rss.append(sum(naive.resid_pearson ** 2))
+        alt_rss.append(sum(aware.resid_pearson ** 2))
+    
+    null_rss = numpy.array(null_rss)
+    alt_rss = numpy.array(alt_rss)
+    # restrict attention to where nonnNaN values can be had
+    null_hyp_not_nan = ~numpy.isnan(null_rss)
+    alt_hyp_not_nan = ~numpy.isnan(alt_rss)
+    null_rss = null_rss[null_hyp_not_nan & alt_hyp_not_nan]
+    alt_rss = alt_rss[null_hyp_not_nan & alt_hyp_not_nan]
+    diff = null_rss - alt_rss
+    alt_rss = alt_rss[~numpy.isnan(diff)]
+    null_rss = null_rss[~numpy.isnan(diff)]
+    # sigma0 squared
+    sig_square = 0.5 * diff.var() / diff.mean()
+    #sig_square = 0.5 * stats.median_abs_deviation(diff) / numpy.median(diff)
+    
+    diff_over_sig = diff / sig_square
+    alt_over_sig = alt_rss / sig_square
+    
+    d1_est = stats.chi2.fit(diff_over_sig)[0]
+    d2_est = stats.chi2.fit(alt_over_sig)[0]
+    
+    p_values = []
+    
+    total_pseudo_r2 = []
+    rel_effect = []
+    
+    prot_names = []
+    
+    gene_names = []
+    
+    for ident, aware, naive in zip(prot_ids, aware_models, naive_models):
+        # should only consider models which have converged,
+        # otherwise cannot detect any significance of interaction
+        if not aware.mle_retvals['converged']:
+            continue
+        if not naive.mle_retvals['converged']:
+            continue
+        local_alt_rss = sum(aware.resid_pearson ** 2)
+        local_null_rss = sum(naive.resid_pearson ** 2)
+        f_stat = (d2_est / d1_est) * ((local_null_rss - local_alt_rss) / local_alt_rss)
+        p_val = stats.f.sf(f_stat, d1_est, d2_est)
+        p_values.append(p_val)
+        
+        total_pseudo_r2.append(aware.prsquared)
+        
+        cohen_f2 = (aware.prsquared - naive.prsquared) / (1 - aware.prsquared)
+        
+        rel_effect.append(cohen_f2)
+        
+        prot_names.append(ident[0])
+        
+        gene_names.append(ident[1])
+    
+    
+    prot_id_arr = numpy.array(prot_ids)
+    
+    stat_table = pandas.DataFrame({
+        
+        'PG.ProteinAccessions' : prot_names,
+        'PG.Genes' : gene_names,
+        'pval' : p_values,
+        'pseudo R2' : total_pseudo_r2,
+        'Cohen f2' : rel_effect,
+        
+        })
+    
+    prot_stats = stat_table.dropna()
+    
+    of_potential_interest = prot_stats.loc[prot_stats['pval'] < 1,:]
+    
+    corrected_stats = of_potential_interest.assign(
+        adj_pval = stats.false_discovery_control(
+            of_potential_interest.loc[:, 'pval'],
+            method='bh'
             )
-        
-        score = logitmodel.score(interactionfeatures,
-                                 cleantable.loc[:, ['Normalized_FG_Quantity']].values)
-        
-        
-        scores.append(score)
-        print(score)
+        )
     
+    sorted_by_effect = corrected_stats.sort_values('Cohen f2').dropna()
     
+    sorted_by_effect = sorted_by_effect.loc[sorted_by_effect.adj_pval < ALPHA, :]
     
-    scores = numpy.array(scores)
-    model_array = numpy.array(models)
-    identifiers = numpy.array(idents)
+    sorted_by_effect.to_csv("C:/Users/piercetf/OneDrive - National Institutes of Health/Documents/CETSA_reports/mostRecentReport.csv")
     
-    statmodels = numpy.array(statmodels)
-    
-    passing_scores = scores[scores > R_THRESHOLD]
-    good_enough_models = model_array[scores > R_THRESHOLD]
-    protein_modeled = identifiers[scores > R_THRESHOLD]
-    passed_statmodels = statmodels[scores > R_THRESHOLD]
-    
-    
-    # prot_idents, prot_preds, models = fit_each_protein(linear_model.RidgeCV(), 
-    #                                                    protein_groups, 
-    #                                                    True)
-    
-    # prot_idents, prot_preds, models = fit_each_protein(svm.SVR(kernel="rbf", 
-    #                                                             C=0.9,
-    #                                                             degree=10,
-    #                                                             coef0=1.0),
-    #                                                     protein_groups,
-    #                                                     False)
-    
-    
-    auc_table = []
-    auc_columns = ["prot_ids", "gene_ids", "treatment", "replicate", "area under curve"]
-    
-    replicates = focused_subset['R.Replicate'].drop_duplicates(ignore_index = True)
-    
-    differences = calc_differences(focused_subset)
-    
-    diffs1 = get_average_differences(differences, 'Fisetin v DMSO')
-    diffs2 = get_average_differences(differences, 'Quercetin v DMSO')
-    diffs3 = get_average_differences(differences, 'Myricetin v DMSO')
-    diffs4 = get_average_differences(differences, 'Fisetin v Myricetin')
-    diffs5 = get_average_differences(differences, 'Quercetin v Myricetin')
-    
-    fisetin_candidates = diffs1[diffs1['Fisetin v DMSO'] > (diffs1['Fisetin v DMSO'].mean() + 2 * diffs1['Fisetin v DMSO'].std())]
-    quercetin_candidates = diffs2[diffs2['Quercetin v DMSO'] > (diffs2['Quercetin v DMSO'].mean() + 2 * diffs2['Quercetin v DMSO'].std())]
-    myricetin_candidates = diffs3[diffs3['Myricetin v DMSO'] > (diffs3['Myricetin v DMSO'].mean() + 2 * diffs3['Myricetin v DMSO'].std())]
-    
-    fisetin_targets = set(fisetin_candidates['PG.ProteinAccessions'])
-    quercetin_targets = set(quercetin_candidates['PG.ProteinAccessions'])
-    myricetin_targets = set(myricetin_candidates['PG.ProteinAccessions'])
-    
-    fisetin_candidates2 = diffs4[diffs4['Fisetin v Myricetin'] > (diffs4['Fisetin v Myricetin'].mean() + 2 * diffs4['Fisetin v Myricetin'].std())]
-    quercetin_candidates2 = diffs5[diffs5['Quercetin v Myricetin'] > (diffs5['Quercetin v Myricetin'].mean() + 2 *diffs5['Quercetin v Myricetin'].std())]
-    
-    fisetin_targets2 = set(fisetin_candidates2['PG.ProteinAccessions'])
-    quercetin_targets2 = set(quercetin_candidates2['PG.ProteinAccessions'])
-    
-    
-    shared_nonsenolytic = fisetin_targets.intersection(quercetin_targets).intersection(myricetin_targets)
-    shared_targets = fisetin_targets.intersection(quercetin_targets).difference(myricetin_targets)
-    unique_fisetin_targets = fisetin_targets.difference(quercetin_targets).difference(myricetin_targets)
-    unique_quercetin_targets = quercetin_targets.difference(myricetin_targets).difference(fisetin_targets)
-    unique_myricetin_targets = myricetin_targets.difference(quercetin_targets).difference(fisetin_targets)
-    
-    fisetin_myricetin = fisetin_targets.intersection(myricetin_targets).difference(quercetin_targets)
-    quercetin_myricetin = quercetin_targets.intersection(myricetin_targets).difference(fisetin_targets)
-    
-    print("Shared targets, probably not involved in senolytic pathways")
-    for item in shared_nonsenolytic:
-        print(item, end = ' ')
-    print('\n"')
-    
-    print("shared targets of quercetin and fisetin but not myricetin")
-    for item in shared_targets:
-        print(item, end=' ')
-    print('\n"')
-    
-    print("unique fisetin targets")
-    for item in unique_fisetin_targets:
-        print(item, end=' ')
-    print('\n"')
-    
-    print("unique quercetin targets")
-    for item in unique_quercetin_targets:
-        print(item, end=' ')
-    print('\n"')
-    
-    print("unique myricetin targets")
-    for item in unique_myricetin_targets:
-        print(item, end=' ')
-    print('\n"')
-
     
