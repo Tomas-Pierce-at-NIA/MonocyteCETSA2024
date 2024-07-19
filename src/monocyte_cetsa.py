@@ -425,12 +425,12 @@ if __name__ == '__main__':
         prot_ids.append(ident)
         
         if VIEW:
-            naive_preds = naive_est.predict(exog=templings)
+            naive_preds = naive_est.predict(exog=templings_with_const)
             aware_preds = aware_est.predict(exog=span_interact_inputs)
             
             pred_table = pandas.DataFrame(
                 data=span_interact_inputs,
-                columns=interactionEncoder.get_feature_names_out()[:8])
+                columns=interactionEncoder.get_feature_names_out()[:9])
             
             pred_table.loc[:,'Treatment'] = span_treatments
             
@@ -538,7 +538,7 @@ if __name__ == '__main__':
     of_potential_interest = prot_stats.loc[prot_stats['pval'] < 1,:]
     
     corrected_stats = of_potential_interest.assign(
-        adj_pval = stats.false_discovery_control(
+        bh_pval = stats.false_discovery_control(
             of_potential_interest.loc[:, 'pval'],
             method='bh'
             )
