@@ -9,33 +9,30 @@ Created on Fri Jun 28 11:15:23 2024
 
 # and also based very heavily on Childs' NPARC
 
-import copy
 
+import itertools
 import pandas
-from pathlib import Path
 import seaborn
 from matplotlib import pyplot
 import numpy
-from sklearn import preprocessing, linear_model
-from scipy import integrate, stats
-
+from sklearn import preprocessing
+from scipy import stats
 import statsmodels.api as sm
-
+from statsmodels.api import GLM
+from statsmodels.api import families
+from statsmodels.api import add_constant
 import load_monocyte_cetsa_data as load
 
 
 ALPHA = 0.05
-EPSILON = 1e-10
+EPSILON = 1e-9
 R_THRESHOLD = 0.6
 F2_THRESHOLD = 0.35 # Cohen f**2 large effect size criterion
+TEMP = "Temperature"
+NORMPROT = "Normalized_FG_Quantity"
 
 VIEW = False
-
-def logit(arr):
-    return numpy.log(arr / (1 - arr))
-
-def unlogit(arr):
-    return 1 / (numpy.exp(-arr) + 1)
+SCALE = True
 
 
 def crimp(datum):
@@ -45,346 +42,204 @@ def crimp(datum):
     elif datum <= 0:
         return EPSILON
     else:
-        return datum
-
-
-
-def interpolate(fitted_model, cat_encode, cuboid=True, feat_args=(3,)) -> pandas.DataFrame:
-    "Use a fitted model to interpolate predicted thermal stability"
-    temps = list(range(50,71))
-    logtemps = numpy.log2(temps)
-    groupcycle = [(1,0,0,0),(0,1,0,0),(0,0,1,0),(0,0,0,1)]
-    interp_conditions = [groupcycle[i % 4] for i in range((71-50)*4)]
-    interp_conditions = numpy.array(interp_conditions)
-    interp_temp = numpy.array([temps, logtemps]).T
-    interp_temp = numpy.repeat(interp_temp, 4, axis=0)
-    base_interpol_feats = numpy.concatenate((interp_temp, 
-                                             interp_conditions), axis=1)
-    if cuboid:
-        cuboid_featureprep = preprocessing.PolynomialFeatures(*feat_args)
-        interpol_feats = cuboid_featureprep.fit_transform(base_interpol_feats)
-        predictions = fitted_model.predict(interpol_feats)
-    else:
-        predictions = fitted_model.predict(base_interpol_feats)
-    
-    categories = cat_encode.categories_[0]
-    
-    dframe = pandas.DataFrame(base_interpol_feats,
-                              columns=['Temperature',
-                                       'log2(Temp)',
-                                       *categories])
-    
-    dframe = dframe.assign(Prediction = predictions)
-    
-    dframe = dframe.assign(Treatment = cat_encode.inverse_transform(
-        base_interpol_feats[:,2:])[:,0])
-    
-    return dframe
+        return datum    
     
 
-def fit_each_protein(raw_model, protein_groups, cuboid=True, feat_args=(3,)):
-    cuboid_featureprep = preprocessing.PolynomialFeatures(*feat_args)
+def interact_param_count(base_params: int) -> int:
     
-    identifiers = []
-    modelpredicts = []
-    fitted_models = {}
-    
-    for identifier, grouptable in protein_groups:
-        raw_model = copy.deepcopy(raw_model)
-        numeric_only = grouptable.drop(['PG.ProteinAccessions', 
-                                        'PG.Genes', 
-                                        'R.Replicate', 
-                                        'Treatment'],
-                                       axis=1,
-                                       inplace=False)
-        y = numpy.array(numeric_only['Normalized_FG_Quantity'])
-        x_base = numpy.array(numeric_only[['Temperature',
-                                           'arctan(Temp)',
-                                           *categories]])
-        if cuboid:
-            x_data = cuboid_featureprep.fit_transform(x_base)
-            
-
-            try:
-                raw_model.fit(x_data, y)
-            except ValueError as er:
-                print("Could not fit {}".format(identifier))
-                print("reason: {}".format(er))
-                print("skipping")
-                continue
-        else:
-            try:
-                raw_model.fit(x_base, y)
-            except ValueError as er:
-                print("Could not fit {}".format(identifier))
-                print("reason: {}".format(er))
-                print("skipping")
-                continue
-        
-        dframe = interpolate(raw_model, treatmentEncoder, cuboid, feat_args)
-        identifiers.append(identifier)
-        modelpredicts.append(dframe)
-        fitted_models[identifier[0]] = copy.deepcopy(raw_model)
-        
-    return identifiers, modelpredicts, fitted_models
+    return base_params + base_params - 1
 
 
-def calc_differences(focused_subset):
-    temps = focused_subset.Temperature.unique()
-    protein_groups = focused_subset.groupby(by=['PG.ProteinAccessions'])
-    frames = []
-    
-    QUANT = 'Normalized_FG_Quantity'
-    
-    for pair in protein_groups:
-        ident, raw = pair
-        dmso = raw.loc[raw['Treatment'] == 'DMSO', :]
-        fisetin = raw.loc[raw['Treatment'] == 'Fisetin', :]
-        quercetin = raw.loc[raw['Treatment'] == 'Quercetin', :]
-        myricetin = raw.loc[raw['Treatment'] == 'Myricetin', :]
-        
-        dmso_avg = dmso.groupby(by=['Temperature']).mean(True).reset_index()
-        fisetin_avg = fisetin.groupby(by=['Temperature']).mean(True).reset_index()
-        quercetin_avg = quercetin.groupby(by=['Temperature']).mean(True).reset_index()
-        myricetin_avg = myricetin.groupby(by=['Temperature']).mean(True).reset_index()
-        
-        fisetin_v_dmso = []
-        quercetin_v_dmso = []
-        myricetin_v_dmso = []
-        
-        fisetin_v_myricetin = []
-        quercetin_v_myricetin = []
-        
-        
-        for temp in temps:
-            
-            temp_dmso = dmso_avg[dmso_avg['Temperature'] == temp]
-            temp_fisetin = fisetin_avg[fisetin_avg['Temperature'] == temp]
-            temp_quercetin = quercetin_avg[quercetin_avg['Temperature'] == temp]
-            temp_myricetin = myricetin_avg[myricetin_avg['Temperature'] == temp]
-            
-            dmso_idx = temp_dmso.first_valid_index()
-            fisetin_idx = temp_fisetin.first_valid_index()
-            quercetin_idx = temp_quercetin.first_valid_index()
-            myricetin_idx = temp_myricetin.first_valid_index()
-            
-            if dmso_idx is None:
-                fisetin_v_dmso.append(numpy.nan)
-                quercetin_v_dmso.append(numpy.nan)
-                myricetin_v_dmso.append(numpy.nan)
-            else:
-                dmso_mmt = temp_dmso.loc[dmso_idx, QUANT]
-                if fisetin_idx is None:
-                    fisetin_v_dmso.append(numpy.nan)
-                else:
-                    diff = temp_fisetin.loc[
-                        fisetin_idx, QUANT] - dmso_mmt
-                    fisetin_v_dmso.append(diff)
-                if quercetin_idx is None:
-                    quercetin_v_dmso.append(numpy.nan)
-                else:
-                    diff = temp_quercetin.loc[
-                        quercetin_idx, QUANT] - dmso_mmt
-                    quercetin_v_dmso.append(diff)
-                if myricetin_idx is None:
-                    myricetin_v_dmso.append(numpy.nan)
-                else:
-                    diff = temp_myricetin.loc[
-                        myricetin_idx, QUANT] - dmso_mmt
-                    myricetin_v_dmso.append(diff)
-            
-            if myricetin_idx is None:
-                fisetin_v_myricetin.append(numpy.nan)
-                quercetin_v_myricetin.append(numpy.nan)
-            
-            else:
-                myricetin_mmt = temp_myricetin.loc[myricetin_idx, QUANT]
-                if fisetin_idx is None:
-                    fisetin_v_myricetin.append(numpy.nan)
-                else:
-                    diff = temp_fisetin.loc[
-                        fisetin_idx, QUANT] - myricetin_mmt
-                    fisetin_v_myricetin.append(diff)
-                if quercetin_idx is None:
-                    quercetin_v_myricetin.append(numpy.nan)
-                else:
-                    diff = temp_quercetin.loc[
-                        quercetin_idx, QUANT] - myricetin_mmt
-                    quercetin_v_myricetin.append(diff)
-        
-        table = {
-            'Temperature' : temps,
-            'PG.ProteinAccessions' : [ident] * len(temps),
-            'Fisetin v DMSO' : fisetin_v_dmso,
-            'Quercetin v DMSO' : quercetin_v_dmso,
-            'Myricetin v DMSO' : myricetin_v_dmso,
-            'Fisetin v Myricetin' : fisetin_v_myricetin,
-            'Quercetin v Myricetin' : quercetin_v_myricetin
-            }
-        
-        frame = pandas.DataFrame(table)
-        
-        frames.append(frame)
-    
-    differencesframe = pandas.concat(frames, ignore_index=True)
-    
-    return differencesframe
-
-# arctangent model for 1 group
-def arctan_model_1(x, k, w, x0, y0):
-    return k * numpy.arctan(w * (x - x0)) + y0
-
-
-def get_average_differences(differences, comparison='Fisetin v DMSO'):
-    prot_deltas = differences.groupby(by=['PG.ProteinAccessions'])
-    averages = []
-    names = []
-    for name, delta in prot_deltas:
-        clean = delta.dropna()
-        if len(clean) == 0:
+def estimate_f_dist(aware_models, naive_models):
+    null_rss = []
+    alt_rss = []
+    if len(aware_models) == 0 or len(naive_models) == 0:
+        raise Exception("what the hell man?")
+    for aware, naive in zip(aware_models, naive_models):
+        if not aware.converged:
             continue
-        #seaborn.scatterplot(clean, x='Temperature', y='Fisetin v DMSO')
-        
-        simpson = integrate.simpson(clean[comparison], x=clean['Temperature'])
-        
-        span = max(clean['Temperature']) - min(clean['Temperature'])
-        
-        if span == 0:
+        if not naive.converged:
             continue
+        null_rss.append(sum(naive.resid_pearson ** 2))
+        alt_rss.append(sum(aware.resid_pearson ** 2))
+    
+    if len(null_rss) == 0:
+        raise Exception("nani the fuck")
+    
+    null_rss = numpy.array(null_rss)
+    alt_rss = numpy.array(alt_rss)
+    
+    null_hyp_not_nan = ~numpy.isnan(null_rss)
+    alt_hyp_not_nan = ~numpy.isnan(alt_rss)
+    
+    null_rss = null_rss[null_hyp_not_nan & alt_hyp_not_nan]
+    alt_rss = alt_rss[null_hyp_not_nan & alt_hyp_not_nan]
+    
+    diff = null_rss - alt_rss
+    
+    null_rss = null_rss[~numpy.isnan(diff)]
+    alt_rss = alt_rss[~numpy.isnan(diff)]
+    
+    sig_square = 0.5 * diff.var() / diff.mean()
+    
+    diff_over_sig = diff / sig_square
+    alt_over_sig = alt_rss / sig_square
+    
+    d1_est = stats.chi2.fit(diff_over_sig)[0]
+    
+    d2_est = stats.chi2.fit(alt_over_sig)[0]
+    
+    return sig_square, d1_est, d2_est
+
+
+class TreatmentEncoder:
+    """"
+    paper thin wrapper around sklearn.preprocessing.OneHotEncoder
+    to handle the specific ways in which it needs to be invoked
+    and used to reshape our data
+    """
+    
+    def __init__(self, table):
         
-        averages.append( simpson / span)
-        names.append(name[0])
-    return pandas.DataFrame({'PG.ProteinAccessions' : names,
-                             comparison : averages}
-                            )
-
-def euclidean(vec1, vec2):
-    v1 = numpy.array(vec1)
-    v2 = numpy.array(vec2)
-    diffs = v1 - v2
-    squares = diffs ** 2
-    total = squares.sum()
-    return numpy.sqrt(total)
-
-
-def logfold_euclidean(vec1, vec2):
-    # log(A/B) = log(A) - log(B)
-    v1 = numpy.array(vec1)
-    v2 = numpy.array(vec2)
-    log1 = numpy.log2(v1)
-    log2 = numpy.log2(v2)
-    return euclidean(log1, log2)
-    
-
-def group_differences(model):
-    dmsoparams = model.coef_[0, [1, 5]]
-    fisetinparams = model.coef_[0, [2, 6]]
-    myricetinparams = model.coef_[0, [3, 7]]
-    quercetinparams = model.coef_[0, [4, 8]]
-    
-    fisetin_v_dmso = logfold_euclidean(fisetinparams, dmsoparams)
-    quercetin_v_dmso = logfold_euclidean(quercetinparams, dmsoparams)
-    myricetin_v_dmso = logfold_euclidean(myricetinparams, dmsoparams)
-    
-    fisetin_v_myricetin = logfold_euclidean(fisetinparams, myricetinparams)
-    quercetin_v_myricetin = logfold_euclidean(quercetinparams, myricetinparams)
-    
-    return [
-        fisetin_v_dmso,
-        quercetin_v_dmso,
-        myricetin_v_dmso,
-        fisetin_v_myricetin,
-        quercetin_v_myricetin
-        ]
-
-
-
-
-if __name__ == '__main__':
-    data, candidates = load.prepare_data()
-    
-    focused_subset = data.loc[:, ['PG.ProteinAccessions',
-                                  'PG.Genes',
-                                  'R.Replicate',
-                                  'Temperature',
-                                  'Treatment',
-                                  'Normalized_FG_Quantity']]
-    
-    focused_subset.loc[:, "log2(Normalized FG Quantity)"] = numpy.log2(
-        focused_subset.loc[:,"Normalized_FG_Quantity"]
-        )
-    
-    focused_subset.loc[:, "arctan(Temp)"] = numpy.arctan(
-        focused_subset.loc[:,"Temperature"]
-        )
-    
-    treatmentEncoder = preprocessing.OneHotEncoder(sparse_output=False, 
+        self.encoder = preprocessing.OneHotEncoder(sparse_output=False,
                                                    dtype=numpy.int32)
-    treatmentEncoder.fit(data.loc[:,['Treatment']])
-    treatmentOneHot = treatmentEncoder.transform(data.loc[:, ['Treatment']])
-    categories = treatmentEncoder.categories_[0]
-
-    
-    for i, category in enumerate(categories):
-        focused_subset = focused_subset.assign(**{category : treatmentOneHot[:,i]})
-
         
-    #breakpoint()
-    #focused_subset = focused_subset.drop_duplicates()
-    focused_subset.loc[:,"Crimped_Protein"] = focused_subset.loc[:,"Normalized_FG_Quantity"].map(crimp)
-                                                                 
-    protein_groups = focused_subset.groupby(by=['PG.ProteinAccessions', 'PG.Genes'])
+        self.encoder.fit(table.loc[:, ['Treatment']])
+        
+        self.categories = self.encoder.categories_[0]
+        
+        self.n_iparams = interact_param_count(len(self.categories) + 1)
     
-    grouplings = numpy.concatenate([numpy.identity(4)] * (71-37), axis=0)
-    templings = numpy.repeat(numpy.arange(37, 71), 4)[...,numpy.newaxis]
+    def encode_treatments(self, table):
+        if len(self.categories) == 0:
+            raise ValueError("cannot encode empty set of categories")
+        cat_arr = self.encoder.transform(table.loc[:, ['Treatment']])
+        for i, category in enumerate(self.categories):
+            table = table.assign(
+                **{category : cat_arr[:, i]}
+                )
+        return table
+    
+    def decode_treatments(self, data):
+        if isinstance(data, numpy.ndarray):
+            return self.encoder.inverse_transform(data)[:,0]
+        elif isinstance(data, pandas.DataFrame):
+            subtable = data.loc[:, self.categories]
+            return self.encoder.inverse_transform(subtable)[:,0]
+        else:
+            raise TypeError("cannot decode from type {}".format(type(data)))
+    
+    def with_treatment_col(self, dataframe):
+        treatments = self.decode_categories(dataframe)
+        return dataframe.assign(Treatment = treatments)
+
+
+class InteractionEncoder:
+    """
+    A wrapper around sklearn.preprocessing.PolynomialFeatures specific
+    to its use for interaction terms in a manner specific to the kind
+    of analysis needed for CETSA, specifically that only interactions
+    between treatment and temperature are to be considered, as 
+    treatments are mutually exclusive.
+    """
+    
+    def __init__(self, num_iparams, categories):
+        
+        self.n_iparams = num_iparams
+        self.encoder = preprocessing.PolynomialFeatures(interaction_only=True,
+                                                        include_bias=False)
+        self.categories = categories
+    
+    def encode_interacts(self, data):
+        if isinstance(data, numpy.ndarray):
+            interacts = self.encoder.fit_transform(data)
+            return interacts[:, :self.n_iparams]
+        elif isinstance(data, pandas.DataFrame):
+            subtable = data.loc[:, [TEMP, *self.categories]]
+            interacts = self.encoder.fit_transform(subtable)
+            colnames = self.encoder.get_feature_names_out([TEMP, *self.categories])
+            table = pandas.DataFrame(data=interacts,
+                                     columns=colnames)
+            return table.loc[:, colnames[0:self.n_iparams]]
+        else:
+            raise TypeError("Cannot calc interactions on type {}".format(type(data)))
+    
+    def get_feature_list(self):
+        interact_feats = self.encoder.get_feature_names_out([TEMP, *self.categories])
+        return interact_feats[:self.n_iparams]
+
+
+def display_alltreatment(protein_table, 
+            aware_model, 
+            naive_model, 
+            num_cats, 
+            interact_encoder, 
+            treatment_encoder,
+            ident):
+    
+    grouplings = numpy.concatenate([numpy.identity(num_cats)] * (71-37), axis=0)
+    templings = numpy.repeat(numpy.arange(37, 71), num_cats)[...,numpy.newaxis]
     spaninputs = numpy.concatenate((templings, grouplings), axis=1)
-    
     templings_with_const = sm.add_constant(templings)
+    span_interact_inputs = interact_encoder.encode_interacts(spaninputs)
+    span_treatments = treatment_encoder.decode_treatments(spaninputs[:,1:])
     
+    naive_preds = naive_model.predict(exog=templings_with_const)
+    aware_preds = aware_model.predict(exog=span_interact_inputs)
     
-    cats = treatmentEncoder.categories_[0]
+    pred_table = pandas.DataFrame(
+        data=span_interact_inputs,
+        columns=interact_encoder.get_feature_list())
     
+    pred_table.loc[:,'Treatment'] = span_treatments
     
+    pred_table.loc[:, 'Naive'] = naive_preds
+    pred_table.loc[:, 'Aware'] = aware_preds
     
-    interactionEncoder = preprocessing.PolynomialFeatures(interaction_only=True,
-                                                          include_bias=False)
+    protein_table.loc[:, "Treatment"] = treatment_encoder.decode_treatments(
+        protein_table
+        )
     
-    span_interact_inputs = interactionEncoder.fit_transform(spaninputs)[:,:9]
+    ax = seaborn.scatterplot(protein_table,
+                              x='Temperature',
+                              y='Norm_Prot',
+                              hue='Treatment')
+    seaborn.lineplot(pred_table,
+                      x='Temperature',
+                      y='Naive',
+                      color='black',
+                      ax=ax)
+    seaborn.lineplot(pred_table,
+                      x='Temperature',
+                      y='Aware',
+                      hue='Treatment',
+                      ax=ax)
     
-    span_treatments = treatmentEncoder.inverse_transform(spaninputs[:,1:])[:,0]
-    
+    pyplot.title(ident[0])
+    pyplot.show(block=False)
+    pyplot.pause(0.25)
+    pyplot.close()
+
+
+def fit_alltreatment_curves(protein_groups, treatment_encoder, interact_encoder, view=VIEW):
     aware_models = []
     naive_models = []
     prot_ids = []
-    
     for ident, table in protein_groups:
         cleantable = table.dropna()
-        #cleantable = cleantable.loc[cleantable['Temperature'] > 37,:]
         if len(cleantable) == 0:
             continue
         if max(cleantable['Normalized_FG_Quantity']) > 1:
             continue
         if max(cleantable['Temperature']) == 37:
             continue
-        
-        
         # note that this loses index information
-        inputdata = interactionEncoder.fit_transform(
-            cleantable.loc[:, ['Temperature', *cats]]
-            )
-        inputs_table = pandas.DataFrame(data=inputdata,
-                                 columns=interactionEncoder.get_feature_names_out())
-        
-        # get rid of columns of all zeros that are zeros definitionally
-        inputs_table = inputs_table.loc[:, inputs_table.columns[0:9]]
-        
+        inputs_table = interact_encoder.encode_interacts(cleantable)
         # so we have to get rid of index information here or pandas
         # will think these things are not aligned
         norm_prot = cleantable.reset_index()['Normalized_FG_Quantity']
-        
         # this will place the normalized protein in the last column
         protein_table = inputs_table.assign(Norm_Prot = norm_prot)
-        
         # check to see if not detected in a condition
         # if there is any condition in which the protein
         # is not detected, the protein is skipped
@@ -392,162 +247,287 @@ if __name__ == '__main__':
         if any(totals == 0):
             continue
         
+        
+        
         with_constant = sm.add_constant(protein_table)
         
-        naive = sm.Logit(endog=protein_table['Norm_Prot'],
-                         exog=with_constant[['Temperature', 'const']],
-                         missing="raise")
+        naive = GLM(endog=protein_table['Norm_Prot'],
+                    exog=with_constant[['const', 'Temperature']],
+                    family=families.Binomial())
         
-        try:
-            naive_est = naive.fit(maxiter=101)
-        except numpy.linalg.LinAlgError as le:
-            print(le)
-            print(ident)
-            continue
+        naive_est = naive.fit()
         
-        # have to exclude last column from predictor to avoid 
-        # y ~ y problem
-        aware = sm.Logit(endog=protein_table['Norm_Prot'],
-                         exog=protein_table.loc[:, protein_table.columns[:-1]],
-                         missing="raise")
+        aware = GLM(endog=protein_table['Norm_Prot'],
+                    exog=inputs_table,
+                    family=families.Binomial())
         
-        try:
-            aware_est = aware.fit(maxiter=101)
-        except numpy.linalg.LinAlgError as le:
-            print(le)
-            print(ident)
-            continue
+        aware_est = aware.fit()
         
         aware_models.append(aware_est)
-        
         naive_models.append(naive_est)
-        
         prot_ids.append(ident)
+        if view:
+            display_alltreatment(protein_table, 
+                    aware_est, 
+                    naive_est, 
+                    len(treatment_encoder.categories),
+                    interact_encoder,
+                    treatment_encoder,
+                    ident)
+    return (aware_models, naive_models, prot_ids)
+
+
+def f_test(aware_model, naive_model, d2, d1):
+    alt_rss = sum(aware_model.resid_pearson ** 2)
+    null_rss = sum(naive_model.resid_pearson ** 2)
+    f_stat = (d2 / d1) * ((null_rss - alt_rss) / alt_rss)
+    pval = stats.f.sf(f_stat, d1, d2)
+    return pval
         
-        if VIEW:
-            naive_preds = naive_est.predict(exog=templings_with_const)
-            aware_preds = aware_est.predict(exog=span_interact_inputs)
-            
-            pred_table = pandas.DataFrame(
-                data=span_interact_inputs,
-                columns=interactionEncoder.get_feature_names_out()[:9])
-            
-            pred_table.loc[:,'Treatment'] = span_treatments
-            
-            pred_table.loc[:, 'Naive'] = naive_preds
-            pred_table.loc[:, 'Aware'] = aware_preds
-            
-            protein_table.loc[:, "Treatment"] = treatmentEncoder.inverse_transform(
-                protein_table.loc[:, cats]
-                )[:,0]
-            
-            ax = seaborn.scatterplot(protein_table,
-                                      x='Temperature',
-                                      y='Norm_Prot',
-                                      hue='Treatment')
-            seaborn.lineplot(pred_table,
-                              x='Temperature',
-                              y='Naive',
-                              color='grey',
-                              ax=ax)
-            seaborn.lineplot(pred_table,
-                              x='Temperature',
-                              y='Aware',
-                              hue='Treatment',
-                              ax=ax)
-            pyplot.show()
-        
-    
-    null_rss = []
-    alt_rss = []
-    for aware, naive in zip(aware_models, naive_models):
-        if not aware.mle_retvals['converged']:
-            continue
-        if not naive.mle_retvals['converged']:
-            continue
-        null_rss.append(sum(naive.resid_pearson ** 2))
-        alt_rss.append(sum(aware.resid_pearson ** 2))
-    
-    null_rss = numpy.array(null_rss)
-    alt_rss = numpy.array(alt_rss)
-    # restrict attention to where nonnNaN values can be had
-    null_hyp_not_nan = ~numpy.isnan(null_rss)
-    alt_hyp_not_nan = ~numpy.isnan(alt_rss)
-    null_rss = null_rss[null_hyp_not_nan & alt_hyp_not_nan]
-    alt_rss = alt_rss[null_hyp_not_nan & alt_hyp_not_nan]
-    diff = null_rss - alt_rss
-    alt_rss = alt_rss[~numpy.isnan(diff)]
-    null_rss = null_rss[~numpy.isnan(diff)]
-    # sigma0 squared
-    sig_square = 0.5 * diff.var() / diff.mean()
-    #sig_square = 0.5 * stats.median_abs_deviation(diff) / numpy.median(diff)
-    
-    diff_over_sig = diff / sig_square
-    alt_over_sig = alt_rss / sig_square
-    
-    d1_est = stats.chi2.fit(diff_over_sig)[0]
-    d2_est = stats.chi2.fit(alt_over_sig)[0]
-    
+
+def alltreatment_analysis(data, candidates, show=False):
+
+    focused_subset = data.loc[:, ['PG.ProteinAccessions',
+                                  'PG.Genes',
+                                  'R.Replicate',
+                                  'Temperature',
+                                  'Treatment',
+                                  'Normalized_FG_Quantity']]
+    treatment_encoder = TreatmentEncoder(focused_subset)
+    interact_encoder = InteractionEncoder(treatment_encoder.n_iparams,
+                                          treatment_encoder.categories)
+    focused_subset = treatment_encoder.encode_treatments(focused_subset)
+    focused_subset.loc[:,"Crimped_Protein"] = focused_subset.loc[:,"Normalized_FG_Quantity"].map(crimp)
+    protein_groups = focused_subset.groupby(by=['PG.ProteinAccessions', 'PG.Genes'])
+    aware_models, naive_models, prot_ids = fit_alltreatment_curves(
+        protein_groups,
+        treatment_encoder,
+        interact_encoder,
+        show
+        )
+    sig_square, d1_est, d2_est = estimate_f_dist(aware_models, naive_models)
     p_values = []
-    
     total_pseudo_r2 = []
     rel_effect = []
-    
     prot_names = []
-    
     gene_names = []
-    
     for ident, aware, naive in zip(prot_ids, aware_models, naive_models):
         # should only consider models which have converged,
         # otherwise cannot detect any significance of interaction
-        if not aware.mle_retvals['converged']:
+        if not aware.converged:
             continue
-        if not naive.mle_retvals['converged']:
+        if not naive.converged:
             continue
-        local_alt_rss = sum(aware.resid_pearson ** 2)
-        local_null_rss = sum(naive.resid_pearson ** 2)
-        f_stat = (d2_est / d1_est) * ((local_null_rss - local_alt_rss) / local_alt_rss)
-        p_val = stats.f.sf(f_stat, d1_est, d2_est)
+        p_val = f_test(aware, naive, d2_est, d1_est)
         p_values.append(p_val)
-        
-        total_pseudo_r2.append(aware.prsquared)
-        
-        cohen_f2 = (aware.prsquared - naive.prsquared) / (1 - aware.prsquared)
-        
+        total_pseudo_r2.append(aware.pseudo_rsquared())
+        cohen_f2 = (aware.pseudo_rsquared() - naive.pseudo_rsquared()) / (1 - aware.pseudo_rsquared())
         rel_effect.append(cohen_f2)
-        
         prot_names.append(ident[0])
-        
         gene_names.append(ident[1])
-    
-    
-    prot_id_arr = numpy.array(prot_ids)
-    
     stat_table = pandas.DataFrame({
-        
         'PG.ProteinAccessions' : prot_names,
         'PG.Genes' : gene_names,
         'pval' : p_values,
         'pseudo R2' : total_pseudo_r2,
         'Cohen f2' : rel_effect,
-        
         })
-    
     prot_stats = stat_table.dropna()
-    
     of_potential_interest = prot_stats.loc[prot_stats['pval'] < 1,:]
-    
     corrected_stats = of_potential_interest.assign(
         bh_pval = stats.false_discovery_control(
             of_potential_interest.loc[:, 'pval'],
             method='bh'
             )
         )
-    
     sorted_by_effect = corrected_stats.sort_values('Cohen f2').dropna()
+    print(len(sorted_by_effect))
+    sorted_by_effect = sorted_by_effect.loc[sorted_by_effect.bh_pval < ALPHA, :]
+    #sorted_by_effect.to_csv("C:/Users/piercetf/OneDrive - National Institutes of Health/Documents/CETSA_reports/mostRecentReport.csv")
+    return sorted_by_effect
+
+
+def pairwise_modelcomp(data, show=False):
+    cols = ['PG.ProteinAccessions','PG.Genes','R.Replicate','Temperature','Treatment', 'Normalized_FG_Quantity']
+    focused_subset = data.loc[:, cols]
+    if SCALE:
+        minmax = preprocessing.MinMaxScaler()
+        refocused_subset = focused_subset.assign(
+            Temperature = minmax.fit_transform(
+                focused_subset.loc[:, ['Temperature']]
+                )
+            )
+    else:
+        refocused_subset = focused_subset
+    # at some point this loses index order information
+    treat_enc = TreatmentEncoder(refocused_subset)
+    treat_encoded = treat_enc.encode_treatments(refocused_subset)
+    interact_enc = InteractionEncoder(treat_enc.n_iparams, treat_enc.categories)
+    interacting = interact_enc.encode_interacts(treat_encoded)
+    # so we have to get rid of the other index to preserve corresponding orders
+    rerefocused_subset = refocused_subset.reset_index()
     
-    sorted_by_effect = sorted_by_effect.loc[sorted_by_effect.adj_pval < ALPHA, :]
+    interacting.loc[:, NORMPROT] = rerefocused_subset.loc[:, NORMPROT]
+    interacting.loc[:, ['PG.ProteinAccessions', 'PG.Genes']] = rerefocused_subset.loc[:,['PG.ProteinAccessions','PG.Genes']]
     
-    sorted_by_effect.to_csv("C:/Users/piercetf/OneDrive - National Institutes of Health/Documents/CETSA_reports/mostRecentReport.csv")
+    prepped_data = add_constant(interacting)
     
+    aware_models = []
+    naive_models = []
+    protein_ids = []
+    gene_ids = []
+    treatment1 = []
+    treatment2 = []
+    
+    protein_groups = prepped_data.groupby(by=['PG.ProteinAccessions', 'PG.Genes'])
+    
+    for ident, prot_table in protein_groups:
+        
+        for cond1, cond2 in itertools.combinations(treat_enc.categories, 2):
+            
+            mask1 = prot_table[cond1] == 1
+            mask2 = prot_table[cond2] == 1
+            pairmask = mask1 | mask2
+            
+            subtable = prot_table.loc[pairmask, :]
+            
+            subtable = subtable.dropna()
+            
+            if len(subtable) == 0 or max(subtable[NORMPROT]) > 1:
+                continue
+            
+            ie = InteractionEncoder(interact_param_count(3), [cond1, cond2])
+            ie.encode_interacts(subtable)
+            
+            naive = GLM(endog=subtable[NORMPROT],
+                        exog=subtable[['const', 'Temperature']],
+                        family=families.Binomial())
+            
+            aware = GLM(endog=subtable[NORMPROT],
+                        exog=subtable[ie.get_feature_list()],
+                        family=families.Binomial())
+            
+            naive_est = naive.fit()
+            aware_est = aware.fit()
+            
+            if show:
+                treatments = treat_enc.decode_treatments(subtable)
+                subtable.loc[:, "Treatment"] = treatments
+                if SCALE:
+                    subtable.loc[:,"RawTemp"] = minmax.inverse_transform(
+                        subtable[['Temperature']]
+                        )
+                else:
+                    subtable.loc[:,"RawTemp"] = subtable.loc[:, "Temperature"]
+                
+                ncats = len(treat_enc.categories)
+                
+                grouplings = numpy.concatenate([numpy.identity(ncats)] * (71-37), axis=0)
+                templings = numpy.repeat(numpy.arange(37, 71), ncats)[...,numpy.newaxis]
+                spaninputs = numpy.concatenate((templings, grouplings), axis=1)
+                rescaler = preprocessing.MinMaxScaler()
+                templings = rescaler.fit_transform(templings)
+                rescaledspan = rescaler.fit_transform(spaninputs)
+                
+                ptable = pandas.DataFrame(
+                    data = interact_enc.encoder.transform(
+                        rescaledspan
+                        )[:,:interact_enc.n_iparams],
+                    columns = interact_enc.get_feature_list()
+                    )
+                ptable2 = sm.add_constant(ptable)
+                
+                ptable2 = ptable2.loc[(ptable2[cond1]==1) | (ptable2[cond2]==1)]
+                
+                ptable2.loc[:,"naive"] = naive_est.predict(ptable2[['const',
+                                                                    'Temperature']])
+                ptable2.loc[:,"aware"] = aware_est.predict(ptable2[
+                    ie.get_feature_list()
+                    ])
+                
+                ptable2.loc[:,"Treatment"] = treat_enc.decode_treatments(ptable2)
+                
+                
+                unscaled_inputs = rescaler.inverse_transform(
+                    ptable2[['Temperature', *treat_enc.categories]]
+                    )
+                ptable2.loc[:, "RawTemp"] = unscaled_inputs[:,0]
+                
+                colors = seaborn.color_palette('hls', n_colors=len(treat_enc.categories))
+                palette = dict(zip(treat_enc.categories, colors))
+                
+                ax = seaborn.scatterplot(subtable,
+                                         x="RawTemp",
+                                         y=NORMPROT,
+                                         hue="Treatment",
+                                         palette=palette)
+                
+                seaborn.lineplot(ptable2,
+                                 x="RawTemp",
+                                 y="naive",
+                                 color="black",
+                                 ax=ax)
+                
+                seaborn.lineplot(ptable2,
+                                 x="RawTemp",
+                                 y="aware",
+                                 hue="Treatment",
+                                 palette=palette,
+                                 ax=ax)
+                
+                pyplot.show()
+                
+                
+            aware_models.append(aware_est)
+            naive_models.append(naive_est)
+            protein_ids.append(ident[0])
+            gene_ids.append(ident[1])
+            treatment1.append(cond1)
+            treatment2.append(cond2)
+    
+    sigsquare, d1_est, d2_est = estimate_f_dist(aware_models, naive_models)
+    
+    pvals = []
+    cohen_f2 = []
+    pseudo_r2s = []
+    
+    for aware, naive in zip(aware_models, naive_models):
+        pval = f_test(aware, naive, d2=d2_est, d1=d1_est)
+        pvals.append(pval)
+        rel_effect = (aware.pseudo_rsquared() - naive.pseudo_rsquared()) / (1 - aware.pseudo_rsquared())
+        cohen_f2.append(rel_effect)
+        pseudo_r2s.append(aware.pseudo_rsquared())
+    
+    bh_pvals = stats.false_discovery_control(pvals)
+    
+    stat_table = pandas.DataFrame({
+        'PG.ProteinAccessions' : protein_ids,
+        'PG.Genes' : gene_ids,
+        'Cond1' : treatment1,
+        'Cond2' : treatment2,
+        'pseudo R2' : pseudo_r2s,
+        'Cohen f2' : cohen_f2,
+        'pval' : pvals,
+        'bh_pval' : bh_pvals
+        })
+    
+    return stat_table
+    
+
+if __name__ == '__main__':
+    
+    data, candidates = load.prepare_data()
+    allcondtable = alltreatment_analysis(data, candidates, show=False)
+    pairtable = pairwise_modelcomp(data, show=True)
+    irrelevant1 = (pairtable['Cond1'] == 'Fisetin') & (pairtable['Cond2'] == 'Quercetin')
+    irrelevant2 = (pairtable['Cond1'] == 'Quercetin') & (pairtable['Cond2'] == "Fisetin")
+    not_relevant = irrelevant1 | irrelevant2
+    relevant = pairtable.loc[~not_relevant,:]
+    
+    relevant.loc[:,'bh_pval'] = stats.false_discovery_control(relevant['pval'])
+    
+    cohenf2_thresh = relevant.loc[relevant['Cohen f2'] >= 0.02, :]
+    
+    bypair = cohenf2_thresh.groupby(by=['Cond1', 'Cond2'])
+    pass
     
