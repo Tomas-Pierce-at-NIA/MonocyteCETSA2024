@@ -717,3 +717,30 @@ def main(data, candidates):
 if __name__ == '__main__':
     data, candidates = load.prepare_data()
     results = main(data, candidates)
+    outtab, fitfail, unobserv_lowtemp, notlogit = results
+    notlogitframe = pandas.DataFrame(data=notlogit,
+                                     columns=['ProteinId',
+                                              'GeneId',
+                                              'Cond1',
+                                              'Cond2']
+                                     )
+    unobs_lowtemp_frame = pandas.DataFrame(data=unobserv_lowtemp,
+                                           columns=['ProteinId',
+                                                    'GeneId',
+                                                    'Cond1',
+                                                    'Cond2']
+                                           )
+    
+    userprof = os.environ['USERPROFILE']
+    
+    outtab.to_csv(f'{userprof}\\Documents\\cetsa_nparc_results.csv')
+    
+    notlogitframe.to_csv(f"{userprof}\\Documents\\cetsa_nonsigmoid_proteins.csv")
+    
+    unobs_lowtemp_frame.to_csv(f"{userprof}\\Documents\\cetsa_no_mintemp.csv")
+    
+    with open(f'{userprof}\\Documents\\fitfailed.txt', 'w') as fitfailhandle:
+        fitfailhandle.write('Following protein ids were attempted to fit and failed\n')
+        fitfailhandle.writelines(fitfail)
+    
+    print("done")
