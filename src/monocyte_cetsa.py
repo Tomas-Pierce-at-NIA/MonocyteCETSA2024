@@ -9,18 +9,29 @@ Created on Fri Jun 28 11:15:23 2024
 
 # and also based very heavily on Childs' NPARC
 
+import cProfile
 
 import itertools
+import logging
+import os
+import multiprocessing
+
 import pandas
+
+import matplotlib
+
+# I love having to do this because people can't
+# expose their parameters properly
+matplotlib.rcParams['legend.loc'] = 'upper right'
+
 import seaborn
 from matplotlib import pyplot
+from matplotlib.backends.backend_pdf import PdfPages
 import numpy
 from sklearn import preprocessing
 from scipy import stats
 import statsmodels.api as sm
-from statsmodels.api import GLM
-from statsmodels.api import families
-from statsmodels.api import add_constant
+from statsmodels.api import GLM, families
 import load_monocyte_cetsa_data as load
 
 
@@ -31,66 +42,20 @@ F2_THRESHOLD = 0.35 # Cohen f**2 large effect size criterion
 TEMP = "Temperature"
 NORMPROT = "Normalized_FG_Quantity"
 
-VIEW = False
-SCALE = True
+CEASE_TOKEN = "Finished"
 
-
-def crimp(datum):
-    datum = float(datum)
-    if datum >= 1:
-        return 1.0 - EPSILON
-    elif datum <= 0:
-        return EPSILON
-    else:
-        return datum    
-    
-
-def interact_param_count(base_params: int) -> int:
-    
-    return base_params + base_params - 1
-
-
-def estimate_f_dist(aware_models, naive_models):
-    null_rss = []
-    alt_rss = []
-    if len(aware_models) == 0 or len(naive_models) == 0:
-        raise Exception("what the hell man?")
-    for aware, naive in zip(aware_models, naive_models):
-        if not aware.converged:
-            continue
-        if not naive.converged:
-            continue
-        null_rss.append(sum(naive.resid_pearson ** 2))
-        alt_rss.append(sum(aware.resid_pearson ** 2))
-    
-    if len(null_rss) == 0:
-        raise Exception("nani the fuck")
-    
-    null_rss = numpy.array(null_rss)
-    alt_rss = numpy.array(alt_rss)
-    
-    null_hyp_not_nan = ~numpy.isnan(null_rss)
-    alt_hyp_not_nan = ~numpy.isnan(alt_rss)
-    
-    null_rss = null_rss[null_hyp_not_nan & alt_hyp_not_nan]
-    alt_rss = alt_rss[null_hyp_not_nan & alt_hyp_not_nan]
-    
-    diff = null_rss - alt_rss
-    
-    null_rss = null_rss[~numpy.isnan(diff)]
-    alt_rss = alt_rss[~numpy.isnan(diff)]
-    
-    sig_square = 0.5 * diff.var() / diff.mean()
-    
-    diff_over_sig = diff / sig_square
-    alt_over_sig = alt_rss / sig_square
-    
-    d1_est = stats.chi2.fit(diff_over_sig)[0]
-    
-    d2_est = stats.chi2.fit(alt_over_sig)[0]
-    
-    return sig_square, d1_est, d2_est
-
+def hypothetical_inputs(dataset):
+    treatments = list(dataset['Treatment'].unique())
+    t_max = dataset['Temperature'].max()
+    t_min = dataset['Temperature'].min()
+    span = numpy.arange(t_min, t_max + 1)
+    temp_span = numpy.repeat(span, len(treatments))
+    treatarr = numpy.array(treatments * ((t_max + 1) - t_min))
+    dframe = pandas.DataFrame({
+        'Temperature' : temp_span,
+        'Treatment' : treatarr
+        })
+    return dframe
 
 class TreatmentEncoder:
     """"
@@ -103,6 +68,7 @@ class TreatmentEncoder:
         
         self.encoder = preprocessing.OneHotEncoder(sparse_output=False,
                                                    dtype=numpy.int32)
+                                                   #drop='first')
         
         self.encoder.fit(table.loc[:, ['Treatment']])
         
@@ -169,365 +135,585 @@ class InteractionEncoder:
         return interact_feats[:self.n_iparams]
 
 
-def display_alltreatment(protein_table, 
-            aware_model, 
-            naive_model, 
-            num_cats, 
-            interact_encoder, 
-            treatment_encoder,
-            ident):
+class ProteinModel:
     
-    grouplings = numpy.concatenate([numpy.identity(num_cats)] * (71-37), axis=0)
-    templings = numpy.repeat(numpy.arange(37, 71), num_cats)[...,numpy.newaxis]
-    spaninputs = numpy.concatenate((templings, grouplings), axis=1)
-    templings_with_const = sm.add_constant(templings)
-    span_interact_inputs = interact_encoder.encode_interacts(spaninputs)
-    span_treatments = treatment_encoder.decode_treatments(spaninputs[:,1:])
+    @property
+    def resid_deviance(self):
+        if self.est is None:
+            raise Exception("no residuals because not yet trained")
+        else:
+            return self.est.resid_deviance
     
-    naive_preds = naive_model.predict(exog=templings_with_const)
-    aware_preds = aware_model.predict(exog=span_interact_inputs)
-    
-    pred_table = pandas.DataFrame(
-        data=span_interact_inputs,
-        columns=interact_encoder.get_feature_list())
-    
-    pred_table.loc[:,'Treatment'] = span_treatments
-    
-    pred_table.loc[:, 'Naive'] = naive_preds
-    pred_table.loc[:, 'Aware'] = aware_preds
-    
-    protein_table.loc[:, "Treatment"] = treatment_encoder.decode_treatments(
-        protein_table
-        )
-    
-    ax = seaborn.scatterplot(protein_table,
-                              x='Temperature',
-                              y='Norm_Prot',
-                              hue='Treatment')
-    seaborn.lineplot(pred_table,
-                      x='Temperature',
-                      y='Naive',
-                      color='black',
-                      ax=ax)
-    seaborn.lineplot(pred_table,
-                      x='Temperature',
-                      y='Aware',
-                      hue='Treatment',
-                      ax=ax)
-    
-    pyplot.title(ident[0])
-    pyplot.show(block=False)
-    pyplot.pause(0.25)
-    pyplot.close()
+    def pseudo_rsquared(self):
+        if self.est is None:
+            raise Exception("No R-squared because not yet trained")
+        else:
+            return self.est.pseudo_rsquared()
 
 
-def fit_alltreatment_curves(protein_groups, treatment_encoder, interact_encoder, view=VIEW):
-    aware_models = []
-    naive_models = []
-    prot_ids = []
-    for ident, table in protein_groups:
-        cleantable = table.dropna()
-        if len(cleantable) == 0:
-            continue
-        if max(cleantable['Normalized_FG_Quantity']) > 1:
-            continue
-        if max(cleantable['Temperature']) == 37:
-            continue
-        # note that this loses index information
-        inputs_table = interact_encoder.encode_interacts(cleantable)
-        # so we have to get rid of index information here or pandas
-        # will think these things are not aligned
-        norm_prot = cleantable.reset_index()['Normalized_FG_Quantity']
-        # this will place the normalized protein in the last column
-        protein_table = inputs_table.assign(Norm_Prot = norm_prot)
-        # check to see if not detected in a condition
-        # if there is any condition in which the protein
-        # is not detected, the protein is skipped
-        totals = protein_table.sum()
-        if any(totals == 0):
-            continue
+class NaiveModel(ProteinModel):
+    
+    def __init__(self, subtable :pandas.DataFrame, scaler :preprocessing.MinMaxScaler):
         
-        
-        
-        with_constant = sm.add_constant(protein_table)
-        
-        naive = GLM(endog=protein_table['Norm_Prot'],
-                    exog=with_constant[['const', 'Temperature']],
-                    family=families.Binomial())
-        
-        naive_est = naive.fit()
-        
-        aware = GLM(endog=protein_table['Norm_Prot'],
-                    exog=inputs_table,
-                    family=families.Binomial())
-        
-        aware_est = aware.fit()
-        
-        aware_models.append(aware_est)
-        naive_models.append(naive_est)
-        prot_ids.append(ident)
-        if view:
-            display_alltreatment(protein_table, 
-                    aware_est, 
-                    naive_est, 
-                    len(treatment_encoder.categories),
-                    interact_encoder,
-                    treatment_encoder,
-                    ident)
-    return (aware_models, naive_models, prot_ids)
+        self.scaler = scaler
+        subtable = subtable.loc[:, [NORMPROT, 'Temperature', 'Treatment']]
+        subtable = subtable.dropna()
+        self.data = subtable.loc[:,:]
+        self.model = None
+        self.est = None
+        self.data.loc[:,'ScaledTemp'] = self.scaler.transform(self.data[['Temperature']])
+        self.data = sm.add_constant(self.data, prepend=True, has_constant='add')
+    
+    def fit(self):
+        self.model = GLM(self.data[NORMPROT], 
+                         self.data[['const', 'ScaledTemp']],
+                         family=families.Binomial())
+        self.est = self.model.fit()
+        return self.est
+    
+    def predict(self, inputdata :pandas.DataFrame):
+        indata = inputdata.assign(
+            ScaledTemp = self.scaler.transform(inputdata[['Temperature']])
+            )
+        indata = sm.add_constant(indata, prepend=True, has_constant='add')
+        predictions = self.est.predict(indata[['const', 'ScaledTemp']])
+        return predictions
+    
+    @property
+    def converged(self):
+        if self.est is None:
+            return False
+        else:
+            return self.est.converged
+    
+    @property
+    def resid_pearson(self):
+        if self.est is None:
+            raise Exception("no residuals because not yet trained")
+        else:
+            return self.est.resid_pearson
 
+
+class AwareModel(ProteinModel):
+    
+    def __init__(self, subtable :pandas.DataFrame, treatment_coder :TreatmentEncoder, scaler :preprocessing.MinMaxScaler):
+        self.scaler = scaler
+        self.treat_coder = treatment_coder
+        subtable = subtable.loc[:, [NORMPROT, 'Temperature', 'Treatment']]
+        subtable = subtable.dropna()
+        self.data = treatment_coder.encode_treatments(subtable)
+        self.data.loc[:, "ScaledTemp"] = scaler.transform(subtable[['Temperature']])
+        self.iparams = treatment_coder.n_iparams
+        categories = treatment_coder.categories
+        self.categories = categories
+        self.interact_enc = preprocessing.PolynomialFeatures(interaction_only=True,
+                                                             include_bias=False)
+        self.interact_enc.fit(self.data[['ScaledTemp', *categories]])
+        interacting = self.interact_enc.transform(self.data[['ScaledTemp', *categories]])
+        interact_feats = self.interact_enc.get_feature_names_out()
+        self.data.loc[:, interact_feats[:self.iparams]] = interacting[:, :self.iparams]
+        
+        self.model = None
+        self.est = None
+    
+    def fit(self):
+        varnames = self.interact_enc.get_feature_names_out()[:self.iparams]
+        self.model = GLM(endog=self.data[NORMPROT],
+                         exog=self.data[varnames],
+                         family=families.Binomial())
+        self.est = self.model.fit()
+        return self.est
+    
+    def predict(self, inputdata :pandas.DataFrame):
+        indata = self.treat_coder.encode_treatments(inputdata)
+        scaledin = indata.assign(
+            ScaledTemp = self.scaler.transform(inputdata[['Temperature']])
+            )
+        interacting = self.interact_enc.transform(scaledin[['ScaledTemp', *self.categories]])
+        interact_feats = self.interact_enc.get_feature_names_out()[:self.iparams]
+        modelinputs = pandas.DataFrame(data=interacting[:,:self.iparams],
+                                       columns=interact_feats)
+        preds = self.est.predict(modelinputs)
+        return preds
+    
+    @property
+    def converged(self):
+        if self.est is None:
+            return False
+        else:
+            return self.est.converged
+    
+    @property
+    def resid_pearson(self):
+        if self.est is None:
+            raise Exception("no residuals because not yet trained")
+        else:
+            return self.est.resid_pearson
+
+
+class NaivePairModel(NaiveModel):
+    
+    def __init__(self, subtable, scaler, cond1, cond2):
+        idx1 = (subtable['Treatment'] == cond1)
+        idx2 = (subtable['Treatment'] == cond2)
+        restrictedtable = subtable.loc[idx1 | idx2, :]
+        super().__init__(restrictedtable, scaler)
+        self.cond1 = cond1
+        self.cond2 = cond2
+
+class AwarePairModel(ProteinModel):
+    
+    def __init__(self, subtable, treatment_coder, scaler, cond1, cond2):
+        idx1 = subtable['Treatment'] == cond1
+        idx2 = subtable['Treatment'] == cond2
+        restrictedtable = subtable.loc[idx1 | idx2, :]
+        subtable = restrictedtable.loc[:, ["Temperature", "Treatment", NORMPROT]]
+        subtable = subtable.dropna()
+        self.treat_coder = treatment_coder
+        self.scaler = scaler
+        self.cond1 = cond1
+        self.cond2 = cond2
+        self.interact_coder = preprocessing.PolynomialFeatures(interaction_only=True,
+                                                               include_bias=False)
+        s_table = treatment_coder.encode_treatments(subtable)
+        s_table.loc[:, "ScaledTemp"] = scaler.transform(s_table[['Temperature']])
+        indep_varnames = ['ScaledTemp', cond1, cond2]
+        self.interact_coder.fit(s_table[indep_varnames])
+        interact_arr = self.interact_coder.transform(s_table[indep_varnames])
+        interact_feats = self.interact_coder.get_feature_names_out()
+        s_table.loc[:, interact_feats[:-1]] = interact_arr[:,:-1]
+        self.data = s_table
+        self.categories = [cond1, cond2]
+        self.iparams = len(interact_feats) - 1
+        self.treat_coder = treatment_coder
+        
+        self.model = None
+        self.est = None
+        
+        self.cond1 = cond1
+        self.cond2 = cond2
+    
+    def fit(self):
+        varnames = self.interact_coder.get_feature_names_out()[:self.iparams]
+        self.model = GLM(endog=self.data[NORMPROT],
+                         exog=self.data[varnames],
+                         family=families.Binomial()
+                         )
+        self.est = self.model.fit()
+        return self.est
+    
+    def predict(self, indata):
+        scaledindata = indata.assign(
+            ScaledTemp = self.scaler.transform(indata[['Temperature']])
+            )
+        scaledindata = self.treat_coder.encode_treatments(scaledindata)
+        indepvarnames = ['ScaledTemp', self.cond1, self.cond2]
+        interact_arr = self.interact_coder.transform(scaledindata[indepvarnames])
+        interact_feats = self.interact_coder.get_feature_names_out()
+        scaledindata.loc[:, interact_feats[:-1]] = interact_arr[:, :-1]
+        modelinputs = pandas.DataFrame(
+            data = interact_arr[:, :-1],
+            columns=interact_feats[:-1]
+            )
+        preds = self.est.predict(modelinputs)
+        return preds
+    
+    @property
+    def converged(self):
+        if self.est is None:
+            return False
+        else:
+            return self.est.converged
+    
+    @property
+    def resid_pearson(self):
+        if self.est is None:
+            raise Exception("no residuals because not yet trained")
+        else:
+            return self.est.resid_pearson
+
+
+class ProteinDisplayPdf:
+    
+    def __init__(self,
+                 sharedmodel_filename :str,
+                 pairmodels_filename :str,
+                 un_sharedmodeled_filename :str,
+                 un_pairmodeled_filename :str):
+        
+        self.sharedmodel_fname = sharedmodel_filename
+        self.pairmodel_fname = pairmodels_filename
+        self.unshare_fname = un_sharedmodeled_filename
+        self.unpair_fname = un_pairmodeled_filename
+        
+        self.share_pages = PdfPages(sharedmodel_filename, keep_empty=False)
+        self.pair_pages = PdfPages(pairmodels_filename, keep_empty=False)
+        self.noshared_pages = PdfPages(un_sharedmodeled_filename, keep_empty=False)
+        self.unpaired_pages = PdfPages(un_pairmodeled_filename, keep_empty=False)
+        
+        self._figure = pyplot.figure()
+        self._ax = self._figure.add_subplot(111)
+        
+        colors = seaborn.color_palette('hls', 4)
+        treats = ['DMSO', 'Fisetin', 'Quercetin', 'Myricetin']
+        self.palette = dict(zip(treats, colors))
+        
+        self.manager = multiprocessing.Manager()
+        
+        self.unpairq = self.manager.Queue()
+        
+        self.unpair_handleproc = multiprocessing.Process(
+            target=_unpair_render2,
+            args=(self.unpaired_pages, self.unpairq, self.palette)
+            )
+        
+        self.unpair_handleproc.start()
+    
+    def __enter__(self):
+        return self
+    
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
+    
+    def close(self):
+        self.share_pages.close()
+        self.pair_pages.close()
+        self.noshared_pages.close()
+        self.signal_unpair_complete()
+        self.unpair_handleproc.join()
+        #self.unpairq.close()
+        self.unpaired_pages.close()
+    
+    def display_pairmodel(self, aware, naive, ptable, hypotable, cond1, cond2, prot_id):
+        idx1 = hypotable['Treatment'] == cond1
+        idx2 = hypotable['Treatment'] == cond2
+        idx = idx1 | idx2
+        subtable = hypotable.loc[idx,:]
+        subtable = subtable.reset_index()
+        aware_preds = aware.predict(subtable)
+        naive_preds = naive.predict(subtable)
+        
+        subtable.loc[:,"Aware"] = aware_preds
+        subtable.loc[:,"Naive"] = naive_preds
+        
+        #figure = pyplot.figure()
+        #ax = figure.add_subplot(111)
+        seaborn.scatterplot(ptable,
+                            x='Temperature',
+                            y=NORMPROT,
+                            hue='Treatment',
+                            ax=self._ax,
+                            palette=self.palette
+            )
+        seaborn.lineplot(subtable,
+                         x='Temperature',
+                         y='Naive',
+                         color='black',
+                         ax=self._ax,
+                         estimator=None,
+                         n_boot=0,
+                         errorbar=None
+                         )
+        seaborn.lineplot(subtable,
+                         x='Temperature',
+                         y='Aware',
+                         hue='Treatment',
+                         ax=self._ax,
+                         estimator=None,
+                         n_boot=0,
+                         errorbar=None,
+                         palette=self.palette
+                         )
+        self._ax.set_title(f"{prot_id}_{cond1}_{cond2}_pairmodel")
+        self.pair_pages.savefig(self._ax.get_figure())
+        self._ax.cla()
+    
+    def display_unpaired(self, ptable, cond1, cond2, prot_id):
+        
+        self.unpairq.put((ptable, cond1, cond2, prot_id))
+    
+    def signal_unpair_complete(self):
+        
+        self.unpairq.put("Finished")
+
+def _unpair_render2(pdf_handle, data_queue, palette):
+    proc_logger = logging.Logger("_unpair_render")
+    proc_logger.setLevel(logging.DEBUG)
+    import os
+    userprof = os.environ['USERPROFILE']
+    filehand = logging.FileHandler(f'{userprof}\\Documents\\unpair.log')
+    proc_logger.addHandler(filehand)
+    to_show = data_queue.get()
+    while to_show != "Finished":
+        try:  
+            ptable, cond1, cond2, prot_id = to_show
+            proc_logger.info(f"attempting to graph {prot_id} for {cond1} and {cond2}")
+            if len(ptable) == 0:
+                proc_logger.info(f"{prot_id} has no data")
+                to_show = data_queue.get()
+                continue
+            # elif len(ptable.dropna()) == 0:
+            #     proc_logger.info(f"{prot_id} has no non-null data")
+            #     proc_logger.info(f"{ptable.columns}")
+            #     proc_logger.info(f"{len(ptable.index)}")
+            
+            ax = seaborn.scatterplot(ptable,
+                                x='Temperature',
+                                y=NORMPROT,
+                                hue='Treatment'
+                                )
+            ax.set_title(f"{prot_id}_{cond1}_{cond2}_nopair")
+            pdf_handle.savefig(ax.get_figure())
+            pyplot.close(ax.get_figure())
+            to_show = data_queue.get()
+            
+            proc_logger.info(f"Attempted plotting {prot_id}")
+            proc_logger.debug(f"ptable of shape rows={len(ptable.index)}")
+            proc_logger.debug(f"and cols={len(ptable.columns)}")
+        
+        except Exception as e:
+            proc_logger.exception("Failure on unpaired rendering",
+                                  exc_info=e)
+            raise e
+    pdf_handle.close()
+            
+
+def interact_param_count(base_params: int) -> int:
+    return base_params + base_params - 1
+
+
+def estimate_f_dist(aware_models, naive_models):
+    """
+    Estimates the empirical f-distribution from the alterate and null
+    models fit to each protein in the data
+
+    Parameters
+    ----------
+    aware_models : list
+        collection of models aware of treatment group distinctions
+    naive_models : list
+        collection of models not aware of treatment group distinctions
+
+    Raises
+    ------
+    Exception
+        when either there are no aware models, no naive models, or no converged
+        null models
+
+    Returns
+    -------
+    sig_square : float
+        sigma squared parameter of estimated f-distribution
+    d1_est : float
+        d1 parameter estimate for empirical f-distribution
+    d2_est : float
+        d2 parameter estimate for empirical f-distribution
+
+    """
+    null_rss = []
+    alt_rss = []
+    if len(aware_models) == 0 or len(naive_models) == 0:
+        raise Exception("what the hell man?")
+    for aware, naive in zip(aware_models, naive_models):
+        if not aware.converged:
+            continue
+        if not naive.converged:
+            continue
+        null_rss.append(sum(naive.resid_pearson ** 2))
+        alt_rss.append(sum(aware.resid_pearson ** 2))
+    
+    if len(null_rss) == 0:
+        raise Exception("nani the fuck")
+    
+    null_rss = numpy.array(null_rss)
+    alt_rss = numpy.array(alt_rss)
+    
+    null_hyp_not_nan = ~numpy.isnan(null_rss)
+    alt_hyp_not_nan = ~numpy.isnan(alt_rss)
+    
+    null_rss = null_rss[null_hyp_not_nan & alt_hyp_not_nan]
+    alt_rss = alt_rss[null_hyp_not_nan & alt_hyp_not_nan]
+    
+    diff = null_rss - alt_rss
+    
+    null_rss = null_rss[~numpy.isnan(diff)]
+    alt_rss = alt_rss[~numpy.isnan(diff)]
+    
+    sig_square = 0.5 * diff.var() / diff.mean()
+    
+    diff_over_sig = diff / sig_square
+    alt_over_sig = alt_rss / sig_square
+    
+    d1_est = stats.chi2.fit(diff_over_sig)[0]
+    
+    d2_est = stats.chi2.fit(alt_over_sig)[0]
+    
+    return sig_square, d1_est, d2_est
 
 def f_test(aware_model, naive_model, d2, d1):
+    "Run an F-test comparing a null (naive) model and a treatment-aware model"
     alt_rss = sum(aware_model.resid_pearson ** 2)
     null_rss = sum(naive_model.resid_pearson ** 2)
     f_stat = (d2 / d1) * ((null_rss - alt_rss) / alt_rss)
     pval = stats.f.sf(f_stat, d1, d2)
     return pval
-        
 
-def alltreatment_analysis(data, candidates, show=False):
+def cohen_f2(aware_model, naive_model):
+    top = aware_model.pseudo_rsquared() - naive_model.pseudo_rsquared()
+    bottom = 1 - aware_model.pseudo_rsquared()
+    return top / bottom
 
-    focused_subset = data.loc[:, ['PG.ProteinAccessions',
-                                  'PG.Genes',
-                                  'R.Replicate',
-                                  'Temperature',
-                                  'Treatment',
-                                  'Normalized_FG_Quantity']]
-    treatment_encoder = TreatmentEncoder(focused_subset)
-    interact_encoder = InteractionEncoder(treatment_encoder.n_iparams,
-                                          treatment_encoder.categories)
-    focused_subset = treatment_encoder.encode_treatments(focused_subset)
-    focused_subset.loc[:,"Crimped_Protein"] = focused_subset.loc[:,"Normalized_FG_Quantity"].map(crimp)
-    protein_groups = focused_subset.groupby(by=['PG.ProteinAccessions', 'PG.Genes'])
-    aware_models, naive_models, prot_ids = fit_alltreatment_curves(
-        protein_groups,
-        treatment_encoder,
-        interact_encoder,
-        show
-        )
-    sig_square, d1_est, d2_est = estimate_f_dist(aware_models, naive_models)
-    p_values = []
-    total_pseudo_r2 = []
-    rel_effect = []
-    prot_names = []
-    gene_names = []
-    for ident, aware, naive in zip(prot_ids, aware_models, naive_models):
-        # should only consider models which have converged,
-        # otherwise cannot detect any significance of interaction
-        if not aware.converged:
-            continue
-        if not naive.converged:
-            continue
-        p_val = f_test(aware, naive, d2_est, d1_est)
-        p_values.append(p_val)
-        total_pseudo_r2.append(aware.pseudo_rsquared())
-        cohen_f2 = (aware.pseudo_rsquared() - naive.pseudo_rsquared()) / (1 - aware.pseudo_rsquared())
-        rel_effect.append(cohen_f2)
-        prot_names.append(ident[0])
-        gene_names.append(ident[1])
-    stat_table = pandas.DataFrame({
-        'PG.ProteinAccessions' : prot_names,
-        'PG.Genes' : gene_names,
-        'pval' : p_values,
-        'pseudo R2' : total_pseudo_r2,
-        'Cohen f2' : rel_effect,
-        })
-    prot_stats = stat_table.dropna()
-    of_potential_interest = prot_stats.loc[prot_stats['pval'] < 1,:]
-    corrected_stats = of_potential_interest.assign(
-        bh_pval = stats.false_discovery_control(
-            of_potential_interest.loc[:, 'pval'],
-            method='bh'
-            )
-        )
-    sorted_by_effect = corrected_stats.sort_values('Cohen f2').dropna()
-    print(len(sorted_by_effect))
-    sorted_by_effect = sorted_by_effect.loc[sorted_by_effect.bh_pval < ALPHA, :]
-    #sorted_by_effect.to_csv("C:/Users/piercetf/OneDrive - National Institutes of Health/Documents/CETSA_reports/mostRecentReport.csv")
-    return sorted_by_effect
-
-
-def pairwise_modelcomp(data, show=False):
-    cols = ['PG.ProteinAccessions','PG.Genes','R.Replicate','Temperature','Treatment', 'Normalized_FG_Quantity']
-    focused_subset = data.loc[:, cols]
-    if SCALE:
+def main(data, candidates):
+    
+    controltemp = data['Temperature'].min()
+    
+    logging.basicConfig(filename="{}\\Documents\\tomas_cetsa.log".format(
+        os.environ['USERPROFILE']), 
+                        encoding='utf-8', 
+                        level=logging.DEBUG)
+    logger = logging.getLogger(__name__)
+    userprofile = os.environ['USERPROFILE']
+    
+    with ProteinDisplayPdf(f"{userprofile}\\Documents\\sharedmodel.pdf",
+                           f"{userprofile}\\Documents\\pairedmodel.pdf",
+                           f"{userprofile}\\Documents\\unshared.pdf",
+                           f"{userprofile}\\Documents\\unshared.pdf"
+                           ) as pdf:
+        hypothetical = hypothetical_inputs(data)
+        proteingroups = data.groupby(by=['PG.ProteinAccessions', 'PG.Genes'])
+        treatments = data['Treatment'].unique()
         minmax = preprocessing.MinMaxScaler()
-        refocused_subset = focused_subset.assign(
-            Temperature = minmax.fit_transform(
-                focused_subset.loc[:, ['Temperature']]
-                )
-            )
-    else:
-        refocused_subset = focused_subset
-    # at some point this loses index order information
-    treat_enc = TreatmentEncoder(refocused_subset)
-    treat_encoded = treat_enc.encode_treatments(refocused_subset)
-    interact_enc = InteractionEncoder(treat_enc.n_iparams, treat_enc.categories)
-    interacting = interact_enc.encode_interacts(treat_encoded)
-    # so we have to get rid of the other index to preserve corresponding orders
-    rerefocused_subset = refocused_subset.reset_index()
-    
-    interacting.loc[:, NORMPROT] = rerefocused_subset.loc[:, NORMPROT]
-    interacting.loc[:, ['PG.ProteinAccessions', 'PG.Genes']] = rerefocused_subset.loc[:,['PG.ProteinAccessions','PG.Genes']]
-    
-    prepped_data = add_constant(interacting)
-    
-    aware_models = []
-    naive_models = []
-    protein_ids = []
-    gene_ids = []
-    treatment1 = []
-    treatment2 = []
-    
-    protein_groups = prepped_data.groupby(by=['PG.ProteinAccessions', 'PG.Genes'])
-    
-    for ident, prot_table in protein_groups:
-        
-        for cond1, cond2 in itertools.combinations(treat_enc.categories, 2):
-            
-            mask1 = prot_table[cond1] == 1
-            mask2 = prot_table[cond2] == 1
-            pairmask = mask1 | mask2
-            
-            subtable = prot_table.loc[pairmask, :]
-            
-            subtable = subtable.dropna()
-            
-            if len(subtable) == 0 or max(subtable[NORMPROT]) > 1:
-                continue
-            
-            ie = InteractionEncoder(interact_param_count(3), [cond1, cond2])
-            ie.encode_interacts(subtable)
-            
-            naive = GLM(endog=subtable[NORMPROT],
-                        exog=subtable[['const', 'Temperature']],
-                        family=families.Binomial())
-            
-            aware = GLM(endog=subtable[NORMPROT],
-                        exog=subtable[ie.get_feature_list()],
-                        family=families.Binomial())
-            
-            naive_est = naive.fit()
-            aware_est = aware.fit()
-            
-            if show:
-                treatments = treat_enc.decode_treatments(subtable)
-                subtable.loc[:, "Treatment"] = treatments
-                if SCALE:
-                    subtable.loc[:,"RawTemp"] = minmax.inverse_transform(
-                        subtable[['Temperature']]
+        minmax.fit(data[['Temperature']])
+        treat_coder = TreatmentEncoder(data)
+        protein_ids = []
+        gene_ids = []
+        pair_ids = []
+        naive_models = []
+        aware_models = []
+        fitting_failed = []
+        unobserved_at_lowest_temp = []
+        not_logit_decay = []
+        i = 0
+        for protein_id, protein_table in proteingroups:
+
+            print(protein_id)
+            pairs = itertools.combinations(treatments, 2)
+            for cond1, cond2 in pairs:
+                idx1 = protein_table['Treatment'] == cond1
+                idx2 = protein_table['Treatment'] == cond2
+                hypo_idx1 = hypothetical['Treatment'] == cond1
+                hypo_idx2 = hypothetical['Treatment'] == cond2
+                restrict_hypo = hypothetical.loc[hypo_idx1 | hypo_idx2, :]
+                restrict_table = protein_table.loc[idx1|idx2, :]
+                
+                cond1_tmin = protein_table.loc[idx1, 'Temperature'].min()
+                cond2_tmin = protein_table.loc[idx2, 'Temperature'].min()
+                
+                if cond1_tmin > controltemp or cond2_tmin > controltemp:
+                    logger.info(
+                        f"""
+                        fitting for {protein_id} is not possible because
+                        relationship to abundance at control temperature
+                        is unknown because {protein_id} is not observed
+                        at control temperature.
+                        min temp for {cond1} on {protein_id} was {cond1_tmin}
+                        min temp for {cond2} on {protein_id} was {cond2_tmin}
+                        """
                         )
-                else:
-                    subtable.loc[:,"RawTemp"] = subtable.loc[:, "Temperature"]
+                    #fitting_failed.append(protein_id[0])
+                    unobserved_at_lowest_temp.append((*protein_id, cond1, cond2))
+                    focusedres = restrict_table.loc[:, ['Temperature',
+                                                        NORMPROT,
+                                                        'Treatment']].copy()
+                    pdf.display_unpaired(focusedres,
+                                         cond1,
+                                         cond2,
+                                         protein_id[0])
+                    continue
                 
-                ncats = len(treat_enc.categories)
+                if restrict_table[NORMPROT].max() > 1:
+                    cond1_idx = restrict_table['Treatment'] == cond1
+                    cond2_idx = restrict_table['Treatment'] == cond2
+                    cond1_max_prot = restrict_table.loc[cond1_idx, NORMPROT].max()
+                    cond2_max_prot = restrict_table.loc[cond2_idx, NORMPROT].max()
+                    logger.info(f"""{protein_id} max protein exceeds physiological
+                                when comparing conditions {cond1} having {cond1_max_prot}
+                                and {cond2} having {cond2_max_prot}
+                                """)
+                    not_logit_decay.append((*protein_id, cond1, cond2))
+                    focusedres = restrict_table.loc[:, ['Temperature',
+                                                        NORMPROT,
+                                                        'Treatment']].copy()
+                    pdf.display_unpaired(focusedres,
+                                         cond1,
+                                         cond2,
+                                         protein_id[0])
+                    continue
+                    
+                try:
+                    naive_pairmod = NaivePairModel(restrict_table, 
+                                                   minmax, 
+                                                   cond1, 
+                                                   cond2)
+                    naive_pairmod.fit()
+                    aware_pairmod = AwarePairModel(restrict_table, 
+                                                   treat_coder, 
+                                                   minmax, 
+                                                   cond1, 
+                                                   cond2)
+                    aware_pairmod.fit()
+                    protein_ids.append(protein_id[0])
+                    gene_ids.append(protein_id[1])
+                    pair_ids.append((cond1, cond2))
+                    naive_models.append(naive_pairmod)
+                    aware_models.append(aware_pairmod)
+                    pdf.display_pairmodel(aware_pairmod,
+                                          naive_pairmod,
+                                          restrict_table,
+                                          restrict_hypo,
+                                          cond1,
+                                          cond2,
+                                          protein_id[0])
+                except ValueError as ve:
+                    fitting_failed.append(protein_id[0])
+                    logger.debug("fitting on {} failed".format(protein_id[0]),
+                                  exc_info=ve)
+                    logger.info(
+                        f"""min temp for {cond1} on {protein_id} was {cond1_tmin}
+                        min temp for {cond2} on {protein_id} was {cond2_tmin}
+                        """
+                        )
+                    pdf.display_unpaired(restrict_table,
+                                         cond1,
+                                         cond2,
+                                         protein_id[0])
                 
-                grouplings = numpy.concatenate([numpy.identity(ncats)] * (71-37), axis=0)
-                templings = numpy.repeat(numpy.arange(37, 71), ncats)[...,numpy.newaxis]
-                spaninputs = numpy.concatenate((templings, grouplings), axis=1)
-                rescaler = preprocessing.MinMaxScaler()
-                templings = rescaler.fit_transform(templings)
-                rescaledspan = rescaler.fit_transform(spaninputs)
-                
-                ptable = pandas.DataFrame(
-                    data = interact_enc.encoder.transform(
-                        rescaledspan
-                        )[:,:interact_enc.n_iparams],
-                    columns = interact_enc.get_feature_list()
-                    )
-                ptable2 = sm.add_constant(ptable)
-                
-                ptable2 = ptable2.loc[(ptable2[cond1]==1) | (ptable2[cond2]==1)]
-                
-                ptable2.loc[:,"naive"] = naive_est.predict(ptable2[['const',
-                                                                    'Temperature']])
-                ptable2.loc[:,"aware"] = aware_est.predict(ptable2[
-                    ie.get_feature_list()
-                    ])
-                
-                ptable2.loc[:,"Treatment"] = treat_enc.decode_treatments(ptable2)
-                
-                
-                unscaled_inputs = rescaler.inverse_transform(
-                    ptable2[['Temperature', *treat_enc.categories]]
-                    )
-                ptable2.loc[:, "RawTemp"] = unscaled_inputs[:,0]
-                
-                colors = seaborn.color_palette('hls', n_colors=len(treat_enc.categories))
-                palette = dict(zip(treat_enc.categories, colors))
-                
-                ax = seaborn.scatterplot(subtable,
-                                         x="RawTemp",
-                                         y=NORMPROT,
-                                         hue="Treatment",
-                                         palette=palette)
-                
-                seaborn.lineplot(ptable2,
-                                 x="RawTemp",
-                                 y="naive",
-                                 color="black",
-                                 ax=ax)
-                
-                seaborn.lineplot(ptable2,
-                                 x="RawTemp",
-                                 y="aware",
-                                 hue="Treatment",
-                                 palette=palette,
-                                 ax=ax)
-                
-                pyplot.show()
-                
-                
-            aware_models.append(aware_est)
-            naive_models.append(naive_est)
-            protein_ids.append(ident[0])
-            gene_ids.append(ident[1])
-            treatment1.append(cond1)
-            treatment2.append(cond2)
-    
-    sigsquare, d1_est, d2_est = estimate_f_dist(aware_models, naive_models)
-    
+                i = i + 1
+                    
+        
+    sigsq, d1_est, d2_est = estimate_f_dist(aware_models,
+                                                naive_models)
+        
     pvals = []
-    cohen_f2 = []
-    pseudo_r2s = []
-    
-    for aware, naive in zip(aware_models, naive_models):
+    cohen_f2s = []
+    for naive, aware in zip(naive_models, aware_models):
         pval = f_test(aware, naive, d2=d2_est, d1=d1_est)
         pvals.append(pval)
-        rel_effect = (aware.pseudo_rsquared() - naive.pseudo_rsquared()) / (1 - aware.pseudo_rsquared())
-        cohen_f2.append(rel_effect)
-        pseudo_r2s.append(aware.pseudo_rsquared())
+        f2_score = cohen_f2(aware, naive)
+        cohen_f2s.append(f2_score)
     
-    bh_pvals = stats.false_discovery_control(pvals)
+    corrected_pvals = stats.false_discovery_control(pvals, method='bh')
     
-    stat_table = pandas.DataFrame({
+    outputtable = pandas.DataFrame({
         'PG.ProteinAccessions' : protein_ids,
         'PG.Genes' : gene_ids,
-        'Cond1' : treatment1,
-        'Cond2' : treatment2,
-        'pseudo R2' : pseudo_r2s,
-        'Cohen f2' : cohen_f2,
+        'Cohen f2' : cohen_f2s,
         'pval' : pvals,
-        'bh_pval' : bh_pvals
+        'bh_pval' : corrected_pvals
         })
     
-    return stat_table
-    
+    return outputtable, fitting_failed, unobserved_at_lowest_temp, not_logit_decay
 
 if __name__ == '__main__':
-    
     data, candidates = load.prepare_data()
-    allcondtable = alltreatment_analysis(data, candidates, show=False)
-    pairtable = pairwise_modelcomp(data, show=True)
-    irrelevant1 = (pairtable['Cond1'] == 'Fisetin') & (pairtable['Cond2'] == 'Quercetin')
-    irrelevant2 = (pairtable['Cond1'] == 'Quercetin') & (pairtable['Cond2'] == "Fisetin")
-    not_relevant = irrelevant1 | irrelevant2
-    relevant = pairtable.loc[~not_relevant,:]
-    
-    relevant.loc[:,'bh_pval'] = stats.false_discovery_control(relevant['pval'])
-    
-    cohenf2_thresh = relevant.loc[relevant['Cohen f2'] >= 0.02, :]
-    
-    bypair = cohenf2_thresh.groupby(by=['Cond1', 'Cond2'])
-    pass
-    
+    results = main(data, candidates)

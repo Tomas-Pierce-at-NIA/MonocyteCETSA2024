@@ -17,11 +17,13 @@ def load_candidates():
     cached_path = Path(CACHED)
     canon_path = Path(CANONICAL)
     try:
-        candidates = pandas.read_csv(cached_path, sep='\t')
+        candidates = pandas.read_csv(cached_path, 
+                                     sep='\t')
     except Exception as e:
         print("Trying to load cached version failed, falling back to canonical path")
         print("Relevant error was: {}".format(e))
-        candidates = pandas.read_csv(canon_path, sep='\t')
+        candidates = pandas.read_csv(canon_path, 
+                                     sep='\t')
     
     return candidates
 
@@ -32,11 +34,13 @@ def load_basedata():
     cached_path = Path(CACHED)
     canon_path = Path(CANONICAL)
     try:
-        basedata = pandas.read_csv(cached_path, sep='\t')
+        basedata = pandas.read_csv(cached_path, 
+                                   sep='\t')
     except Exception as e:
         print("Trying to load cached version failed, falling back to canonical path")
         print("Relevant error was: {}".format(e))
-        basedata = pandas.read_csv(canon_path, sep='\t')
+        basedata = pandas.read_csv(canon_path, 
+                                   sep='\t')
     
     # empty string is more accurate and avoids NaN-based pathology
     # later on
@@ -48,19 +52,12 @@ def remove_unipeptides(data_table, candidate_table) -> (pandas.DataFrame, pandas
     data table and the candidates table.
     Returns the results in the same order as the parameters.
     """
-    onepeptide_candidates = candidate_table[candidate_table['# Unique Total Peptides'] == 1]
-    unipeptide_ids = onepeptide_candidates['UniProtIds'].unique()
-    multipeptide_candidates = candidate_table[candidate_table['# Unique Total Peptides'] > 1]
     
-    def not_in_unipeptides(accession):
-        return accession not in unipeptide_ids
-    
-    multipeptide_data_membership = data_table['PG.ProteinAccessions'].map(
-        not_in_unipeptides
-        )
-    
-    multipeptide_data_table = data_table.loc[multipeptide_data_membership,:]
-    
+    multipeptide_idx = candidate_table['# Unique Total Peptides'] > 1
+    multipeptide_candidates = candidate_table.loc[multipeptide_idx, :]
+    multipeptide_ids = set(multipeptide_candidates['UniProtIds'])
+    multipeptide_data_idx = data_table['PG.ProteinAccessions'].isin(multipeptide_ids)
+    multipeptide_data_table = data_table.loc[multipeptide_data_idx, :]
     return multipeptide_data_table, multipeptide_candidates
 
 def remove_deprecated_columns(table):
@@ -104,7 +101,6 @@ def load_data():
     # add aliases for variables to avoid problems with special characters
     multipep_candidates = rename_special_columns(multipep_candidates)
     
-    # split out between substance and temperature
     multipep_candidates.loc[:, "Treatment_Numerator"] = multipep_candidates["Condition Numerator"].map(get_left)
     multipep_candidates.loc[:, "Temperature_Numerator"] = multipep_candidates["Condition Numerator"].map(get_right)
     multipep_candidates.loc[:, "Treatment_Denominator"] = multipep_candidates["Condition Denominator"].map(get_left)
@@ -153,13 +149,17 @@ def display_counts(data):
         by=["R.Replicate", "Treatment"]
         ).nunique().loc[:,["PG.ProteinAccessions", "Temperature"]].reset_index()
     print(itemcounts)
+    itemcounts['R.Replicate'] = itemcounts['R.Replicate'].astype(str)
     seaborn.barplot(data=itemcounts, 
                     x="Treatment", 
                     y="Temperature", 
                     hue="R.Replicate"
                     )
     pyplot.ylabel("Number of Temperatures tested")
-    pyplot.show()
+    fig = pyplot.gcf()
+    pyplot.show(block=False)
+    pyplot.pause(2.0)
+    pyplot.close(fig)
     
     seaborn.barplot(data=itemcounts,
                     x="Treatment",
@@ -167,8 +167,11 @@ def display_counts(data):
                     hue="R.Replicate"
                     )
     pyplot.ylabel("Number of detected proteins")
-
-    pyplot.show()
+    
+    fig = pyplot.gcf()
+    pyplot.show(block=False)
+    pyplot.pause(2.0)
+    pyplot.close(fig)
 
 
 def norm_protein_mintemp(data):
@@ -176,13 +179,16 @@ def norm_protein_mintemp(data):
     at the lowest tested temperature
     """
     mintemp = min(data['Temperature'])
-    lowtempdata = data.loc[data['Temperature'] == mintemp,:].copy()
-    lowtempdata.loc[:,'Referent_Protein'] = lowtempdata.loc[:, 'Total_FG_Quantity']
+    mintempidx = data['Temperature'] == mintemp
+    lowtempdata = data.loc[mintempidx,:].assign(
+        Referent_Protein = data.loc[mintempidx, 'Total_FG_Quantity']
+        )
+    
     lowtempgroups = lowtempdata.groupby(
         by=["PG.ProteinAccessions",
             "PG.Genes",
             "R.Replicate",
-            "Treatment"]).min()
+            "Treatment"]).min(numeric_only=True)
     merged_frame = data.join(lowtempgroups, how="left",
                              on=["PG.ProteinAccessions",
                                  "PG.Genes",
@@ -192,11 +198,31 @@ def norm_protein_mintemp(data):
     return data['Total_FG_Quantity'] / merged_frame['Referent_Protein']
 
 
-def prepare_data():
+def prepare_data(display=False):
     "General data loading routine, including filtering and normalization"
     filtered_data, filtered_candidates = load_data()
     calc_total_protein_quantity(filtered_data)
-    display_counts(filtered_data)
+    if display:
+        display_counts(filtered_data)
     filtered_data.loc[:,"Normalized_FG_Quantity"] = norm_protein_mintemp(filtered_data)
     return filtered_data, filtered_candidates
 
+def _main():
+    data, cans = prepare_data()
+
+if __name__ == '__main__':
+    
+    #_main()
+    data, cans = prepare_data()
+    
+    # import cProfile
+    # import os
+    
+    # profiler = cProfile.Profile()
+    # profiler.enable()
+    # try:
+    #     data, cans = prepare_data()
+    # finally:
+    #     user = os.environ['USERPROFILE']
+    #     profiler.disable()
+    #     profiler.dump_stats(f"{user}\\Documents\\dataload.runprofile")
