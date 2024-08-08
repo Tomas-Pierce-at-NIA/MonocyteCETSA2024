@@ -9,6 +9,7 @@ import requests
 
 import asyncio
 import aiohttp
+import aiofiles
 
 import json
 
@@ -28,28 +29,6 @@ async def start_job(session :aiohttp.ClientSession, job_params :dict) -> dict:
         bodystr = await resp.text()
         data = json.loads(bodystr)
     return data
-
-# async def check_job(session :aiohttp.ClientSession, jobid :str) -> bool:
-#     async with session.get(STATUS + '/' + jobid, allow_redirects=False) as resp:
-#         bodystr = await resp.text()
-#         data = json.loads(bodystr)
-#         finished = data['jobStatus'] == 'FINISHED'
-#     return finished
-
-# async def request_results(session :aiohttp.ClientSession, jobid :str):
-#     async with session.get(RESULTS + '/' + jobid) as resp:
-#         bodystr = await resp.text()
-#         data = json.loads(bodystr)
-#     return data
-
-# async def get_results_when_ready(session :aiohttp.ClientSession, jobid :str):
-#     ready = await check_job(session, jobid)
-#     while not ready:
-#         # only check once every 10 seconds to avoid hammering the service
-#         await asyncio.sleep(10.0)
-#         ready = await check_job(session, jobid)
-#     results = await request_results(session, jobid)
-#     return results
 
 async def checkout_results(session :aiohttp.ClientSession, jobid :str):
     async with session.get(STATUS + '/' + jobid, allow_redirects=True) as resp:
